@@ -1,0 +1,235 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ActionDecision",
+  "description": "Standard action protocol schema for auto-answering desktop assistant",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "frame_id",
+    "page_state",
+    "answer_display",
+    "action",
+    "expected_change"
+  ],
+  "properties": {
+    "frame_id": {
+      "type": "string",
+      "description": "Unique identifier of the captured view frame"
+    },
+    "page_state": {
+      "type": "string",
+      "enum": [
+        "question",
+        "feedback",
+        "completed",
+        "blocked",
+        "unknown"
+      ],
+      "description": "Current perceived webpage state"
+    },
+    "answer_display": {
+      "type": "string",
+      "description": "Human-readable summary or rationale for current step"
+    },
+    "action": {
+      "description": "Single-step atomic action to be performed",
+      "anyOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "fill",
+                "type_text"
+              ]
+            },
+            "target": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "minItems": 2,
+              "maxItems": 2,
+              "description": "[x, y] coordinates within current image frame"
+            },
+            "text": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Non-empty text content to inject into input field"
+            }
+          },
+          "required": [
+            "type",
+            "target",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "click"
+              ]
+            },
+            "purpose": {
+              "type": "string",
+              "enum": [
+                "answer",
+                "submit",
+                "next"
+              ]
+            },
+            "target": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "minItems": 2,
+              "maxItems": 2,
+              "description": "[x, y] coordinates of target to click"
+            }
+          },
+          "required": [
+            "type",
+            "purpose",
+            "target"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "drag"
+              ]
+            },
+            "purpose": {
+              "type": "string",
+              "enum": [
+                "answer",
+                "submit",
+                "next"
+              ]
+            },
+            "start": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "minItems": 2,
+              "maxItems": 2,
+              "description": "[x, y] coordinates of starting point"
+            },
+            "end": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "minItems": 2,
+              "maxItems": 2,
+              "description": "[x, y] coordinates of release point"
+            }
+          },
+          "required": [
+            "type",
+            "purpose",
+            "start",
+            "end"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "scroll"
+              ]
+            },
+            "direction": {
+              "type": "string",
+              "enum": [
+                "up",
+                "down"
+              ]
+            },
+            "steps": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10,
+              "description": "Number of scroll wheel ticks (range 1-10)"
+            }
+          },
+          "required": [
+            "type",
+            "direction",
+            "steps"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "wait"
+              ]
+            },
+            "wait_ms": {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 5000,
+              "description": "Milliseconds to wait for network or animation settling"
+            }
+          },
+          "required": [
+            "type",
+            "wait_ms"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": [
+                "stop"
+              ]
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Reason for halting execution"
+            }
+          },
+          "required": [
+            "type",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "expected_change": {
+      "type": "string",
+      "description": "Expected visual feedback on webpage to verify after execution"
+    },
+    "ready_to_submit": {
+      "type": "boolean",
+      "description": "True only if this action enters the final remaining complete answer; false for intermediate digits, focusing fields, or opening Answer."
+    }
+  }
+}

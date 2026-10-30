@@ -1,0 +1,53 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.spec
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv/
+env/
+venv/
+ENV/
+
+# Temporary run artifacts
+temp_*.png
+temp_*.jpg
+output_*.json
+frame_*.png
+*.log
+
+# Sensitive credentials
+*API KEY*.txt
+.env
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Replacement API credentials
+/OpenAI-KEY.txt
+
+# Local screenshots and diagnostic results (may contain personal data)
+/*.png
+/*.jpg
+/*.jpeg
+/*_result.json
+/performance_benchmark.json
+/information.txt
+/prompt.txt
+/scratch_screens.ps1
+
+# Other local credentials
+.env.*
+*KEY*.txt
