@@ -2,6 +2,8 @@
 
 A Python 3.10+ desktop assistant for Sparx Maths. A vision model plans answer entry while local controls verify progress, handle submissions, and enforce cancellation safeguards.
 
+See the [User Guide](USER_GUIDE.md) for setup, browser selection, solving, bookwork checks, workings exports, and troubleshooting.
+
 ## Run locally
 
 ```bash
@@ -11,7 +13,7 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
-On Solver, select the existing Chrome homework window or open the separate browser and sign in. Configuration contains the number of new correct answers to complete and advanced pacing settings. Esc stops automation; existing-window mode uses the desktop mouse and keyboard.
+On Solver, select the existing Chrome homework window or open the separate browser and sign in. The app detects the full visible question set automatically. Configuration contains advanced pacing settings. Esc stops automation; existing-window mode uses the desktop mouse and keyboard.
 
 ## Bookwork checks (initial numeric support)
 
