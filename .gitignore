@@ -51,3 +51,12 @@ Thumbs.db
 # Other local credentials
 .env.*
 *KEY*.txt
+
+# Local homework memory and exports
+/homework/
+/exports/
+
+# Private generated workings saved in the repository root
+/*_workings.md
+/*_workings.html
+/*_workings.pdf

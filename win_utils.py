@@ -141,7 +141,10 @@ def activate_target_window(hwnd: int) -> bool:
         if user32.IsIconic(wintypes.HWND(hwnd)):
             user32.ShowWindow(wintypes.HWND(hwnd), 9) # SW_RESTORE
 
-        # Tap Alt key to allow SetForegroundWindow without permission denial
+        if user32.GetForegroundWindow() == hwnd:
+            return True
+
+        # Tap Alt only when a foreground change is actually required.
         VK_MENU = 0x12
         KEYEVENTF_KEYUP = 0x0002
         user32.keybd_event(VK_MENU, 0, 0, 0)

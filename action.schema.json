@@ -230,6 +230,56 @@
     "ready_to_submit": {
       "type": "boolean",
       "description": "True only if this action enters the final remaining complete answer; false for intermediate digits, focusing fields, or opening Answer."
+    },
+    "solution": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "question_code",
+            "parts"
+          ],
+          "properties": {
+            "question_code": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "parts": {
+              "type": "array",
+              "maxItems": 10,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "part",
+                  "answer"
+                ],
+                "properties": {
+                  "part": {
+                    "type": "string"
+                  },
+                  "answer": {
+                    "type": "string"
+                  },
+                  "workings_latex": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 2048
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
     }
   }
 }

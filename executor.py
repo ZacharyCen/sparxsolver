@@ -64,8 +64,14 @@ class ActionExecutor:
             self.browser_session.release_inputs()
             return
         try:
-            self.mouse.release(Button.left)
-            self.mouse.release(Button.right)
+            for button, virtual_key in ((Button.left,0x01),(Button.right,0x02)):
+                # A synthetic right-button UP without a held button opens Chrome's
+                # context menu on Windows. Release held inputs, not idle buttons.
+                if sys.platform == 'win32':
+                    import ctypes
+                    if not ctypes.windll.user32.GetAsyncKeyState(virtual_key) & 0x8000:
+                        continue
+                self.mouse.release(button)
         except Exception:
             pass
 
@@ -90,7 +96,13 @@ class ActionExecutor:
             return
 
         action_type = action.get("type")
-        if action_type == "type_text":
+        if action_type == 'press_enter':
+            if getattr(self,'browser_session',None):
+                self.browser_session.key('Enter','Enter',13)
+            else:
+                try:self.keyboard.press(Key.enter)
+                finally:self.keyboard.release(Key.enter)
+        elif action_type == "type_text":
             self.type_text(action["target"], action["text"])
         elif action_type == "fill":
             self.fill(action["target"], action["text"])
@@ -153,7 +165,7 @@ class ActionExecutor:
                     return
                 key = char
                 if sys.platform == "win32":
-                    vk = {"-": 0x6D, ".": 0x6E}.get(char, ord(char))
+                    vk = {"-": 0xBD, ".": 0xBE}.get(char, ord(char))
                     key = pynput.keyboard.KeyCode.from_vk(vk)
                 held_key = key
                 self.keyboard.press(held_key)

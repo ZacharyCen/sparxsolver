@@ -229,23 +229,20 @@ def test_emergency_cancellation_and_fail_safe_release():
 
     def mock_mouse_release(btn):
         released_buttons.append(btn)
-        try:
-            original_mouse_release(btn)
-        except Exception:
-            pass
 
     def mock_kbd_release(key):
         released_keys.append(key)
-        try:
-            original_kbd_release(key)
-        except Exception:
-            pass
 
     executor.mouse.release = mock_mouse_release
     executor.keyboard.release = mock_kbd_release
 
     # Test release_all_inputs
-    executor.release_all_inputs()
+    from contextlib import nullcontext
+    from unittest.mock import patch
+    import sys
+    held = patch('ctypes.windll.user32.GetAsyncKeyState', return_value=0x8000) if sys.platform == 'win32' else nullcontext()
+    with held:
+        executor.release_all_inputs()
     print(f"Released buttons during cleanup: {released_buttons}")
     print(f"Released modifier keys during cleanup: {[str(k) for k in released_keys]}")
 

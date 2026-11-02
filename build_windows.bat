@@ -53,8 +53,6 @@ if %ERRORLEVEL% neq 0 (
 )
 
 echo ====================================================
-if exist "OpenAI-KEY.txt" copy /Y "OpenAI-KEY.txt" "dist\OpenAI-KEY.txt" >nul
-if exist "OpenAI-KEY.txt" copy /Y "OpenAI-KEY.txt" "dist\AutoAnswer_Win_x64_dir\OpenAI-KEY.txt" >nul
 echo  Build Completed Successfully!
 echo  Executable: dist\AutoAnswer_Win_x64.exe
 echo ====================================================

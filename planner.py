@@ -25,6 +25,14 @@ from typing import Dict, Any, Optional
 import jsonschema
 
 
+def compact_solution_context(solution):
+    """Reuse answers without repeatedly sending already-saved workings to the model."""
+    if not solution:
+        return None
+    return {'question_code': solution.get('question_code'), 'parts': [
+        {'part': part.get('part', ''), 'answer': part.get('answer', '')} for part in solution.get('parts', [])]}
+
+
 def get_default_schema_path() -> str:
     """Returns the default absolute path to action.schema.json."""
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -62,6 +70,7 @@ class CodexCliPlanner(BasePlanner):
     def __init__(self, codex_bin: Optional[str] = None, schema_path: Optional[str] = None):
         self.schema_path = schema_path or get_default_schema_path()
         self.reasoning_effort = "low"
+        self.accepted_solution = None
         self.question_memory = ""
         self.recent_steps = []
         self.retry_context = ""
@@ -74,6 +83,7 @@ class CodexCliPlanner(BasePlanner):
     def reset_question_memory(self) -> None:
         """Reset retry instructions and reasoning for the next question."""
         self.reasoning_effort = "low"
+        self.accepted_solution = None
         self.question_memory = self.retry_context = ""
         self.recent_steps = []
 
@@ -252,6 +262,7 @@ class CodexCliPlanner(BasePlanner):
             f"You are an autonomous homework answering assistant on Sparx Maths.\n"
             f"Current Question State: {question_state} (new correct answers in THIS run; ignore previously completed sidebar items).\n"
             f"Complete every part of a multipart question before submission. A filled part a is not a completed question. Never infer the run target was met from existing checkmarks; the controller owns that counter.\n"
+            f"Structured solution: {json.dumps(compact_solution_context(self.accepted_solution), ensure_ascii=False)}\n"
             f"Retry instructions: {self.retry_context}\n"
             f"Previous Step Result: {previous_result or 'None (initial step)'}\n\n"
             f"Auxiliary Detection Reference Table:\n{auxiliary_reference}\n\n"
@@ -266,6 +277,13 @@ class CodexCliPlanner(BasePlanner):
             f"COORDINATES: Use pixels in the original attached image, origin top-left; use OCR centers to locate controls. Never infer coordinates from a resized preview.\n"
             f"VERIFICATION: Previous results are observations, not proof of success. If a click had no confirmed effect, re-locate the target. Do not repeat an ineffective click blindly.\n"
             f"Only use purpose='next' on actual result feedback with a Continue/next-question control, and set page_state='feedback'. A button that returns to question text is NOT question completion.\n"
+            "If question text is visible, return solution={question_code,parts:[{part,answer,workings_latex}]} for ALL parts. "
+            "Answer is the EXACT input content: if x=5, answer must be 5, not x=5. Use part=empty string only for a genuinely single-part question; Preserve units and full answer meaning; unsupported answers will need review. "
+            "For choice questions, give chosen letters in one part as A or A,B,F,H for multi-select, without explanatory prose. "
+            "Use solution=null for navigation or an unreadable code; never invent a code. "
+            "For each part, workings_latex is the MINIMAL essential calculation (prefer 1-3 short equalities), with NO WORDS or dollar delimiters. Use equalities and only \\frac, \\cdot, \\times, \\div, \\implies, \\Rightarrow, integer powers, \\sqrt, \\approx and parentheses. Fractions require both braced arguments. End with the exact numeric answer. Example: x+2=7\\implies x=7-2=5. Always provide workings for numeric answers you have calculated, including decimal solutions; use \\sqrt{...} and \\approx for rounded results and end with the displayed rounded number. Use null only if genuinely unsupported; never invent a derivation. Generate workings only while solving, not again for navigation. "
+            "If starting on an answer keypad without any known solution, click Back/Question ONCE with purpose='answer' to read the hidden question. Do not claim a blocker just because question text is hidden. "
+            "A bookwork check is handled locally: stop if one unexpectedly reaches you. "
             f"Instruction: Return ONLY the single next atomic action JSON strictly adhering to schema."
         )
 
@@ -389,6 +407,8 @@ class RemoteApiPlanner(BasePlanner):
         self.base_url = base_url or defaults["base_url"]
         self.model = model or defaults["model"]
         self.recent_steps = []
+        self.accepted_solution = None
+        self.generate_workings = True
         self.question_memory = ""
         self.last_usage = {}
         self.usage_callback = None
@@ -406,8 +426,11 @@ class RemoteApiPlanner(BasePlanner):
 
         def compact_schema(value):
             if isinstance(value, dict):
-                return {k: compact_schema(v) for k, v in value.items()
-                        if k not in ("description", "title", "$schema")}
+                result = {k: compact_schema(v) for k, v in value.items()
+                          if k not in ("description", "title", "$schema")}
+                if result.get("type") == "object" and "properties" in result:
+                    result["required"] = list(result["properties"])
+                return result
             if isinstance(value, list):
                 return [compact_schema(v) for v in value]
             return value
@@ -423,6 +446,7 @@ class RemoteApiPlanner(BasePlanner):
 
     def reset_question_memory(self) -> None:
         """Discard the previous solution after verified navigation to a new question."""
+        self.accepted_solution = None
         self.question_memory = ""
         self.recent_steps = []
         self.reasoning_effort = "low"
@@ -490,19 +514,26 @@ class RemoteApiPlanner(BasePlanner):
             f"Sparx Maths desktop controller. Image: {width}x{height}; coordinates are original-image pixels from top-left.\n"
             f"Session: {question_state}. Count only new correct answers; controller owns the limit, not sidebar checkmarks.\n"
             f"Saved question/solution: {self.question_memory or 'None'}\n"
+            f"Structured solution: {json.dumps(compact_solution_context(self.accepted_solution), ensure_ascii=False)}\n"
             f"Retry instructions: {self.retry_context}\n"
             f"Recent actions: {history}\nResult: {previous_result or 'Initial'}\n"
             f"Current OCR centers (optional): {auxiliary_reference}\n"
             "Solve ALL parts before opening Answer; record the full solution concisely in answer_display. "
             + ("After incorrect feedback, return to Question if needed and re-solve; do not trust a rejected solution. " if self.retry_context else
-             "The answer page hides the question: use saved solution; never navigate Back/Previous/Question to recover it. ")
+             "The answer page hides the question: use the saved solution. ONLY if no solution is known at startup, click Back/Question ONCE with purpose='answer' to read it before solving. ")
             + ("For numeric fields/custom keypads, prefer type_text to enter the whole number via physical keys in one action. "
              if self.keyboard_entry_enabled else "Keyboard entry is disabled; use visible keypad keys one per action. ")
             + "Use fill for normal text inputs. If keyboard entry is rejected, fall back to visible keypad clicks. "
-            "Verify the actual entered value; do not repeat ineffective fills/clicks. "
+            "Verify the actual entered value; do not repeat ineffective fills/clicks. Once solved, select all saved correct choices exactly once; never change choices merely to explore. Keep answer_display to the answer and essential context, not a repeated explanation. "
             "Submit only when all parts are filled. Use next only on graded feedback with Continue, page_state=feedback. "
             "Page transitions: wait only if still loading. Stop on real blockers (login/CAPTCHA/crash), not ordinary question controls. "
             "Set ready_to_submit=true only when this action fills the LAST remaining answer completely. False for focusing, opening Answer, or intermediate keypad digits. "
+            "When question text is visible, include solution={question_code,parts:[{part,answer,workings_latex}]} for ALL numeric answer fields in VISUAL READING ORDER (left to right, then next row); "
+            "Use a separate part for each input slot, never combine coordinate pairs into one answer. For a proof confirmation plus numeric fields, record the numeric fields separately. part is empty only for a genuinely single-part question. answer is EXACT input content: use 5, not x=5. Preserve units and answer meaning. "
+            "For choice questions, give chosen letters in one part as A or A,B,F,H for multi-select, without explanatory prose. "
+            "Use solution=null for navigation or an unreadable code. The controller provides the verified code in Session. "
+            + ("For each part, workings_latex is the MINIMAL essential calculation (prefer 1-3 short equalities), with NO WORDS or dollar delimiters. Use equalities and only \\frac, \\cdot, \\times, \\div, \\implies, \\Rightarrow, integer powers, \\sqrt, \\approx and parentheses. Fractions require both braced arguments. End with the exact numeric answer. Example: x+2=7\\implies x=7-2=5. Always provide workings for numeric answers you have calculated, including decimal solutions; use \\sqrt{...} and \\approx for rounded results and end with the displayed rounded number. Use null only if genuinely unsupported; never invent a derivation. Generate workings only while solving, not again for navigation. " if self.generate_workings else "Workings generation is OFF for this question set. Return workings_latex=null for every part. Still provide every exact numeric answer for entry and bookwork memory. Do not produce derivations or a workings document. ")
+            + "Never guess on a bookwork check; stop if it reaches you. "
             "Return one schema-valid atomic action; concise answer_display and expected_change."
         )
 

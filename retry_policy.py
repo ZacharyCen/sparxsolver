@@ -24,7 +24,7 @@ def question_tabs(frame, items: list) -> tuple:
     height, width = frame.shape[:2]
     for item in items:
         label = item.get("text", "").strip().upper()
-        match = re.fullmatch(r"(\d+[A-Z])(?:\s*[✓✔×✕X])?", label)
+        match = re.fullmatch(r"(\d+[A-Z])(?:\s*[✓✔×✕Xx])?", label)
         x, y = map(int, item.get("center", [0, 0]))
         if not match or not (0 < y < height * .35 and 0 < x < width):
             continue
@@ -81,3 +81,29 @@ class QuestionRetries:
                 "attempts": self.attempts, "screenshot": str(screenshot)}, ensure_ascii=False) + "\n")
         self.logged = True
         return path
+
+
+class RecoveryGuard:
+    """Bound waits and Back/Answer oscillation independently of animation pixels."""
+    def __init__(self):
+        self.waits = 0
+        self.navigation = []
+
+    def observe(self, action, items):
+        kind = action.get('type')
+        self.waits = self.waits + 1 if kind == 'wait' else 0
+        label = None
+        target = action.get('target')
+        if kind == 'click' and target:
+            for item in items:
+                name = item.get('text', '').strip().lower()
+                center = item.get('center', [0, 0])
+                if name in ('back', 'question', 'back to question', 'answer', 'try again') and abs(center[0]-target[0]) < 100 and abs(center[1]-target[1]) < 40:
+                    label = name
+                    break
+        if label:
+            self.navigation.append(label)
+            self.navigation = self.navigation[-6:]
+        elif kind not in ('wait', 'stop'):
+            self.navigation.clear()
+        return self.waits >= 4 or (len(self.navigation) >= 6 and len(set(self.navigation)) <= 2)

@@ -11,6 +11,8 @@ Implements:
 import os
 import sys
 import ctypes
+import hashlib
+import re
 from typing import Dict, List, Any, Optional, Tuple
 
 import cv2
@@ -121,8 +123,8 @@ class Observer:
     def detect_correct_continue(self, image: np.ndarray) -> Optional[list]:
         """Find graded feedback in the footer, caching verified label templates.
 
-        No OCR runs unless a large green feedback banner is present. Subsequent
-        matching banners use the cached Correct/Continue patches instead of OCR.
+        Green banners use cached templates. Other layouts use a small cached footer
+        read, including the final Summary button, rather than a full model request.
         """
         height, width = image.shape[:2]
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -163,7 +165,37 @@ class Observer:
                 self._feedback_templates = [gray[t:b, l:r].copy() for l, t, r, b in boxes]
                 left, top, right, bottom = labels["continue"]
                 return [int(x + (left+right)//2), int(y + (top+bottom)//2)]
-        return None
+        return self.footer_continue(image)
+
+    def footer_continue(self, image):
+        """Recognize Correct + Continue/Summary in the footer, never a navigation tab."""
+        h,w=image.shape[:2];x,y=int(w*.10),int(h*.84)
+        crop=image[y:,x:int(w*.98)]
+        hsv=cv2.cvtColor(crop,cv2.COLOR_BGR2HSV)
+        colored=cv2.inRange(hsv,(30,12,80),(130,255,255))
+        if np.mean(colored>0)<.01:return None
+        signature=cv2.resize(cv2.cvtColor(crop,cv2.COLOR_BGR2GRAY),(400,80))
+        cached=getattr(self,'_footer_signature',None)
+        if cached is not None and np.mean(cv2.absdiff(cached,signature))<.4:
+            return self._footer_target
+        raw,_=self._ocr(crop)
+        labels={}
+        for points,text,confidence in raw or []:
+            text=str(text).strip().lower().rstrip('!.')
+            if confidence>=.85:
+                labels[text]=np.mean(points,axis=0)
+        correct=any(label in labels for label in ('correct','well done','correct answer'))
+        control=next((labels[label] for label in ('continue','summary','view summary') if label in labels),None)
+        target=[int(x+control[0]),int(y+control[1])] if correct and control is not None else None
+        self._footer_items=[{'text':label,'center':[int(x+point[0]),int(y+point[1])],'confidence':.99}
+                            for label,point in labels.items()]
+        self._footer_signature,self._footer_target=signature,target
+        return target
+
+    def footer_navigation_items(self, image):
+        """Reuse current footer grounding for navigation guards between full OCR refreshes."""
+        self.footer_continue(image)
+        return getattr(self,'_footer_items',[])
 
     def detect_enabled_submit(self, image: np.ndarray) -> Optional[list]:
         """Locate a blue Submit answer control, never a disabled gray button."""
@@ -188,19 +220,240 @@ class Observer:
                 return [x+w//2, y+h//2]
         return None
 
-    def verify_numeric_entry(self, image: np.ndarray, target: list, expected: str) -> bool:
-        """Read only the edited answer slot before allowing a keyboard fast submit."""
-        x, y = target
+    def choice_buttons(self, image):
+        """Read a complete contiguous letter-button group and its current selection locally."""
+        if not self.answer_page_visible(image):return None
+        h,w=image.shape[:2];x,y=int(w*.15),int(h*.25)
+        crop=image[y:int(h*.88),x:int(w*.9)]
+        key=hashlib.blake2b(crop.tobytes(),digest_size=16).digest()
+        if getattr(self,'_choices_key',None)==key:return self._choices
+        self._choices_key,self._choices=key,None
+        choices={};seen=[]
+        edges=cv2.morphologyEx(cv2.Canny(cv2.cvtColor(image,cv2.COLOR_BGR2GRAY),40,130),cv2.MORPH_CLOSE,np.ones((3,3),np.uint8))
+        contours=cv2.findContours(edges,cv2.RETR_LIST,cv2.CHAIN_APPROX_SIMPLE)[0]
+        glyph_cache=getattr(self,'_choice_glyphs',{})
+        for contour in sorted(contours,key=cv2.contourArea,reverse=True):
+            l,t,bw,bh=cv2.boundingRect(contour);cx,cy=l+bw//2,t+bh//2
+            if not (w*.015<bw<w*.12 and h*.02<bh<h*.1 and x<cx<w*.9 and y<cy<h*.88):continue
+            if len(cv2.approxPolyDP(contour,.025*cv2.arcLength(contour,True),True))!=4:continue
+            if any(abs(cx-a)<10 and abs(cy-b)<10 for a,b in seen):continue
+            seen.append((cx,cy))
+            button=image[t+8:t+bh-8,l+8:l+bw-8]
+            hsv=cv2.cvtColor(button,cv2.COLOR_BGR2HSV)
+            selected=np.mean(cv2.inRange(hsv,(95,90,130),(125,255,255))>0)>.3
+            ink=cv2.inRange(hsv,(0,0,215),(179,40,255)) if selected else cv2.inRange(cv2.cvtColor(button,cv2.COLOR_BGR2GRAY),0,155)
+            points=cv2.findNonZero(ink)
+            if points is None:continue
+            gx,gy,gw,gh=cv2.boundingRect(points)
+            glyph=255-ink[gy:gy+gh,gx:gx+gw]
+            glyph=cv2.copyMakeBorder(glyph,10,10,10,10,cv2.BORDER_CONSTANT,value=255)
+            signature=hashlib.blake2b(glyph.tobytes(),digest_size=16).digest()
+            if signature not in glyph_cache:
+                raw,_=self._ocr(glyph,use_det=False,use_cls=False)
+                glyph_cache[signature]=[(str(item[0]).strip(),item[1]) for item in raw or []]
+            labels=glyph_cache[signature]
+            if len(labels)!=1 or labels[0][1]<.85 or not re.fullmatch('[A-Z]',labels[0][0]):continue
+            label=labels[0][0]
+            if label in choices:return None
+            choices[label]={'target':[cx,cy],'selected':bool(selected)}
+        if len(glyph_cache)>64:glyph_cache.clear()
+        self._choice_glyphs=glyph_cache
+        letters=sorted(choices)
+        if len(letters)<2 or letters!=[chr(65+i) for i in range(len(letters))]:return None
+        self._choices_key,self._choices=key,choices
+        return choices
+
+    def letter_choice(self, image, expected):
+        """Reconcile every saved choice, removing extras before selecting missing answers."""
+        text=str(expected).strip()
+        if not re.fullmatch(r'[A-Z](?:\s*(?:,|and|&)\s*[A-Z])*',text):return None
+        wanted=re.findall('[A-Z]',text)
+        if len(set(wanted))!=len(wanted):return None
+        choices=self.choice_buttons(image)
+        if not choices or any(letter not in choices for letter in wanted):return None
+        extra=[letter for letter,choice in choices.items() if choice['selected'] and letter not in wanted]
+        missing=[letter for letter in wanted if not choices[letter]['selected']]
+        changes=extra+missing
+        if not changes:return {'complete':True}
+        return {'complete':False,'target':choices[changes[0]]['target'],'last_change':len(changes)==1}
+
+    def selected_visual_answer(self, image):
+        """Extract the square diagram inside a selected blue answer card, excluding controls."""
+        h,w=image.shape[:2]
+        mask=cv2.inRange(cv2.cvtColor(image,cv2.COLOR_BGR2HSV),(95,90,130),(125,255,255))
+        for contour in sorted(cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)[0],key=cv2.contourArea,reverse=True):
+            x,y,bw,bh=cv2.boundingRect(contour)
+            if not (w*.10<bw<w*.45 and h*.12<bh<h*.6 and y>h*.22):continue
+            card=image[y:y+bh,x:x+bw]
+            dark=cv2.inRange(cv2.cvtColor(card,cv2.COLOR_BGR2GRAY),0,70)
+            for edge in sorted(cv2.findContours(dark,cv2.RETR_LIST,cv2.CHAIN_APPROX_SIMPLE)[0],key=cv2.contourArea,reverse=True):
+                l,t,fw,fh=cv2.boundingRect(edge)
+                if fw>bw*.4 and fh>bh*.4 and .85<fw/fh<1.15:
+                    return card[max(0,t-3):min(bh,t+fh+3),max(0,l-3):min(bw,l+fw+3)].copy()
+            white=cv2.inRange(card,(245,245,245),(255,255,255))
+            for panel in sorted(cv2.findContours(white,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)[0],key=cv2.contourArea,reverse=True):
+                l,t,fw,fh=cv2.boundingRect(panel)
+                if fw>bw*.6 and fh>bh*.4 and fw<bw*.98 and fh<bh*.95:
+                    return card[t:t+fh,l:l+fw].copy()
+        # Letter-only geometry pages can have several selected correct answers.
+        choices=self.choice_buttons(image)
+        letters=[letter for letter,choice in (choices or {}).items() if choice['selected']]
+        if letters:
+            text=', '.join(sorted(letters))
+            answer=np.full((120,max(140,65*len(text)),3),255,np.uint8)
+            cv2.putText(answer,text,(20,85),cv2.FONT_HERSHEY_SIMPLEX,2,(25,25,25),3,cv2.LINE_AA)
+            return answer
+        return None
+
+    def question_inventory(self, image):
+        """Cache the tab row; input edits never need another full-screen OCR pass."""
+        from question_set import read_inventory
+        h,w=image.shape[:2];bottom=int(h*.32)
+        crop=image[:bottom]
+        signature=cv2.resize(cv2.cvtColor(crop,cv2.COLOR_BGR2GRAY),(500,100))
+        previous=getattr(self,'_inventory_signature',None)
+        if previous is not None and previous.shape==signature.shape and np.mean(cv2.absdiff(previous,signature))<.15:
+            return self._inventory_value
+        raw,_=self._ocr(crop,use_cls=False)
+        items=[{'text':str(text),'confidence':confidence,'center':np.mean(points,axis=0).tolist()} for points,text,confidence in raw or []]
+        self._independent_learning=any('independent' in item['text'].lower() for item in items)
+        result=read_inventory(image,items)
+        self._inventory_signature,self._inventory_value=signature,result
+        return result
+
+    def read_question_code(self, image):
+        """Read only the navy selected tab when full-screen OCR misses its code."""
+        h,w = image.shape[:2]
+        top = image[:int(h*.35)]
+        mask=cv2.inRange(cv2.cvtColor(top,cv2.COLOR_BGR2HSV),(100,65,35),(140,255,155))
+        candidates=[]
+        for contour in cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)[0]:
+            x,y,bw,bh=cv2.boundingRect(contour)
+            if 35 < bw < w*.14 and 25 < bh < h*.10 and y > h*.08 and w*.1 < x < w*.85:
+                crop=top[y:y+bh,x:x+bw]
+                if np.mean(mask[y:y+bh,x:x+bw]>0) < .5:
+                    continue
+                key=hashlib.blake2b(crop.tobytes(),digest_size=16).digest()
+                cache=getattr(self,'_tab_codes',{})
+                if key not in cache:
+                    gray=cv2.cvtColor(crop,cv2.COLOR_BGR2GRAY)
+                    glyph=cv2.threshold(gray,180,255,cv2.THRESH_BINARY_INV)[1]
+                    glyph=cv2.copyMakeBorder(cv2.resize(glyph,None,fx=3,fy=3),20,20,20,20,cv2.BORDER_CONSTANT,value=255)
+                    raw,_=self._ocr(glyph)
+                    codes=[]
+                    for _,text,confidence in raw or []:
+                        match=re.fullmatch(r'(\d{1,3}[A-Z])(?:\s*[✓✔×✕Xx])?',str(text).strip())
+                        if match and confidence >= .75:
+                            codes.append(match[1])
+                    cache[key]=codes[0] if len(set(codes))==1 else None
+                    self._tab_codes=cache
+                if cache[key]:candidates.append(cache[key])
+        return candidates[0] if len(set(candidates)) == 1 else None
+
+    def answer_page_visible(self, image):
+        """Recognize the submission footer even when empty fields disable it."""
+        h,w = image.shape[:2]
+        crop = image[int(h*.90):, int(w*.70):]
+        key = hashlib.blake2b(crop.tobytes(),digest_size=16).digest()
+        if getattr(self,'_answer_footer_key',None) == key:
+            return self._answer_footer_present
+        raw,_ = self._ocr(crop)
+        text = ' '.join(str(item[1]).lower().replace(' ','') for item in raw or [] if item[2] >= .8)
+        present = 'submitanswer' in text
+        self._answer_footer_key,self._answer_footer_present = key,present
+        return present
+
+    def numeric_fields(self, image):
+        """Read bordered white answer slots in visual reading order, excluding keys."""
+        from bookwork import numeric_value
         height, width = image.shape[:2]
-        crop = image[max(0, y-55):min(height, y+55), max(0, x-150):min(width, x+150)]
-        if not crop.size:
-            return False
-        raw, _ = self._ocr(crop)
-        for _, text, confidence in raw or []:
-            value = str(text).strip().replace("−", "-").replace(" ", "")
-            if confidence >= .85 and value == expected:
-                return True
-        return False
+        edges = cv2.Canny(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), 40, 130)
+        edges = cv2.morphologyEx(edges,cv2.MORPH_CLOSE,np.ones((3,3),np.uint8))
+        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = []
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True):
+            x, y, w, h = cv2.boundingRect(contour)
+            if not (width*.045 <= w <= width*.24 and height*.023 <= h <= height*.10
+                    and height*.22 < y < height*.86 and w > h*1.4):
+                continue
+            if len(cv2.approxPolyDP(contour, .025*cv2.arcLength(contour, True), True)) != 4:
+                continue
+            inner = image[y+6:y+h-6, x+6:x+w-6]
+            if not inner.size or np.mean(np.min(inner, axis=2) > 245) < .78:
+                continue
+            if any(abs(x+w/2-(a+c/2)) < 12 and abs(y+h/2-(b+d/2)) < 12 for a,b,c,d in boxes):
+                continue
+            boxes.append((x,y,w,h))
+        fields = []
+        for x,y,w,h in sorted(boxes, key=lambda b: (round((b[1]+b[3]/2)/30), b[0])):
+            crop = image[y+5:y+h-5, x+5:x+w-5]
+            labels = self.read_numeric_labels(crop)
+            text = labels[0] if len(labels) == 1 else ''
+            if not labels or numeric_value(text) is not None or text.lower().replace(' ', '') in ('enternumber', 'enteranswer'):
+                fields.append({'target': [x+w//2,y+h//2], 'value': text, 'focused': bool(np.any(cv2.inRange(cv2.cvtColor(image[y:y+h,x:x+w],cv2.COLOR_BGR2HSV),(90,65,180),(125,255,255))))})
+        return fields
+
+    def keypad_controls(self, image):
+        """Ground Sparx's four-row numeric keypad in visible key rectangles."""
+        h,w = image.shape[:2]
+        mask = cv2.inRange(cv2.cvtColor(image,cv2.COLOR_BGR2HSV),(95,2,200),(125,100,255))
+        boxes=[]
+        for contour in cv2.findContours(mask,cv2.RETR_LIST,cv2.CHAIN_APPROX_SIMPLE)[0]:
+            x,y,bw,bh=cv2.boundingRect(contour)
+            if w*.035 < bw < w*.18 and h*.022 < bh < h*.08 and y > h*.35 and x > w*.15:
+                boxes.append((x,y,bw,bh))
+        rows=[]
+        for box in sorted(boxes,key=lambda b:b[1]):
+            if not rows or abs(box[1]-rows[-1][0][1]) > 12:
+                rows.append([])
+            rows[-1].append(box)
+        for start in range(max(0,len(rows)-3)):
+            grid=[sorted(row) for row in rows[start:start+4]]
+            if [len(row) for row in grid] != [4,4,3,2]:
+                continue
+            # Recognize the top numeric row before assigning the fixed keypad layout.
+            recognized=[]
+            for x,y,bw,bh in grid[0][:3]:
+                crop=image[y:y+bh,x:x+bw]
+                key=hashlib.blake2b(crop.tobytes(),digest_size=16).digest()
+                cache=getattr(self,'_key_labels',{})
+                if key not in cache:
+                    raw,_=self._ocr(crop)
+                    cache[key]=''.join(str(t).strip() for _,t,c in raw or [] if c >= .8)
+                    self._key_labels=cache
+                recognized.append(cache[key])
+            if recognized != ['7','8','9']:
+                continue
+            labels=[['7','8','9','delete'],['4','5','6','-'],['1','2','3'],['0','.']]
+            return {label:[x+bw//2,y+bh//2] for row,names in zip(grid,labels) for (x,y,bw,bh),label in zip(row,names)}
+        return None
+
+    def read_numeric_labels(self, crop):
+        """OCR a confirmed numeric field; normalize the narrow 1/I glyph only here."""
+        key = hashlib.blake2b(crop.tobytes(), digest_size=16).digest()
+        cache = getattr(self, '_numeric_cache', {})
+        if key in cache:
+            return cache[key]
+        padded = cv2.copyMakeBorder(cv2.resize(crop,None,fx=2,fy=2),16,16,16,16,cv2.BORDER_CONSTANT,value=(255,255,255))
+        raw, _ = self._ocr(padded, use_cls=False)
+        labels = [str(text).strip() for _,text,confidence in raw or [] if confidence >= .80]
+        if not raw or (len(raw) == 1 and str(raw[0][1]).strip() in ('I','l','L','|') and raw[0][2] >= .50):
+            ink = cv2.inRange(cv2.cvtColor(crop,cv2.COLOR_BGR2GRAY),0,150)
+            points = cv2.findNonZero(ink)
+            if points is not None:
+                _,_,w,h = cv2.boundingRect(points)
+                if h > 12 and .14 < w/h < .4:
+                    labels = ['1']
+        if len(cache) > 64:
+            cache.clear()
+        cache[key] = labels
+        self._numeric_cache = cache
+        return labels
+
+    def verify_numeric_entry(self, image: np.ndarray, target: list, expected: str) -> bool:
+        """Read the enclosing field, avoiding labels beside the input."""
+        from bookwork import BookworkSession
+        return BookworkSession(self, None).verify_entry(image, target, expected)
 
     def extract_auxiliary_reference(self, image: np.ndarray) -> Dict[str, Any]:
         """

@@ -37,9 +37,6 @@ pyinstaller --noconfirm --windowed \
     --collect-all onnxruntime \
     main.py
 
-if [[ -f "OpenAI-KEY.txt" ]]; then
-    cp "OpenAI-KEY.txt" "dist/${APP_NAME}.app/Contents/MacOS/OpenAI-KEY.txt"
-fi
 
 # Package into DMG if hdiutil is available (macOS native tool)
 echo "[3/3] Packaging into DMG..."

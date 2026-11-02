@@ -18,6 +18,8 @@ import customtkinter as ctk
 import pynput.keyboard
 import pyperclip
 
+from homework_store import HomeworkStore
+from bookwork import BookworkSession
 from solver_ui import SolverUI
 from observer import init_dpi_awareness, Observer
 from planner import CodexCliPlanner, RemoteApiPlanner, BasePlanner
@@ -432,6 +434,7 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
         # Core Components
         self.observer = Observer()
         self.executor = ActionExecutor()
+        self.homework_store = None
         self.browser_session = None
         self._opening_browser = False
         self.planner: Optional[BasePlanner] = None
@@ -455,6 +458,22 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
 
         # Redirect standard streams to in-app Console Log
         self._setup_logging()
+
+    def destroy(self):
+        """Finish queued local exports and release input when the panel closes."""
+        if getattr(self, "_is_running", False):
+            if getattr(self, "controller", None):
+                try: self.controller.stop("Application closed")
+                except Exception: pass
+            if getattr(self, "executor", None):
+                try: self.executor.cancel()
+                except Exception: pass
+        exporter = getattr(self, "_workings_exporter", None)
+        if exporter:
+            if getattr(self, "homework_store", None):
+                self.homework_store.on_change = None
+            exporter.close(wait=False)
+        super().destroy()
 
     def _build_ui(self):
         self.build_workspace()
@@ -599,15 +618,12 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
             "height": w["height"]
         }
         self.executor.set_roi_offset(w["left"], w["top"])
-        display_title = w["title"][:26] + ("..." if len(w["title"]) > 26 else "")
-        self.window_select_btn.configure(
-            text="Use existing Chrome window" if self.browser_var.get() else f"Existing: {display_title}",
-            border_color="#22c55e"
-        )
+        self.window_select_btn.configure(border_color="#22c55e")
         self.status_label.configure(
-            text="Open your homework browser in Configuration, then press Start." if self.browser_var.get() else "Ready to solve in the selected window.",
+            text="Open your homework browser above, then press Start." if self.browser_var.get() else "Ready to solve in the selected window.",
             text_color="#4ade80"
         )
+        self._refresh_browser_controls()
         self.log(f"Target Window selected: '{w['title']}' (HWND: {w['hwnd']}) at ({w['left']}, {w['top']}) {w['width']}x{w['height']}")
         if not self.browser_var.get():
             self.after(100, self._place_solver_beside_homework, self.selected_region)
@@ -617,6 +633,7 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
 
     def _on_region_selected(self, region: Dict[str, int]):
         self.selected_hwnd = None  # Using custom manual drag region
+        self.selected_window_title = ""
         self.selected_region = region
         self.executor.set_roi_offset(region["left"], region["top"])
         self.window_select_btn.configure(
@@ -627,6 +644,7 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
             text="Ready to solve the selected screen area.",
             text_color="lightgreen"
         )
+        self._refresh_browser_controls()
         self.log(f"Custom ROI selected: ({region['left']}, {region['top']}) {region['width']}x{region['height']}")
 
     def _start_global_listeners(self):
@@ -654,13 +672,10 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
             self.log("Stop the run before switching browser mode.")
         if hasattr(self, "option_switches") and len(self.option_switches) > 2:
             self.option_switches[2].configure(state="disabled" if self.browser_var.get() else "normal")
-        for name in ("refresh_btn", "roi_quick_btn"):
-            if hasattr(self, name):
-                getattr(self, name).configure(state="disabled" if self.browser_var.get() else "normal")
         if hasattr(self, "topmost_badge"):
             self.topmost_badge.configure(text="Separate browser" if self.browser_var.get() else "Existing window")
-        if hasattr(self, "window_select_btn"):
-            self.window_select_btn.configure(text="Use existing Chrome window" if self.browser_var.get() else ("Existing: " + self.selected_window_title[:40] if self.selected_window_title else "Use existing Chrome window"))
+        if hasattr(self, "browser_mode_switch"):
+            self._refresh_browser_controls()
         enabled = self.delay_var.get()
         self.wait_slider.configure(state="normal" if enabled else "disabled")
         self.wait_label.configure(text=f"Waiting Time: {self.waiting_time:.1f} s" if enabled else "Waiting Time: off")
@@ -669,11 +684,17 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
         self.executor.keyboard_entry_enabled = self.keyboard_var.get()
         if self.planner:
             self.planner.keyboard_entry_enabled = self.keyboard_var.get()
+            self.planner.generate_workings = self.workings_var.get()
         if self.controller:
             self.controller.waiting_time = self.waiting_time if enabled else 0
             self.controller.fast_submit = self.submit_var.get()
+            self.controller.require_bookwork = self.bookwork_var.get()
+            if self.controller.bookwork:
+                self.controller.bookwork.collect_workings = self.workings_var.get()
         if hasattr(self, "human_var"):
             self.human_var.set("On" if self.delay_var.get() or (self.pointer_var.get() and not self.browser_var.get()) else "Off")
+        if hasattr(self, "_workings_store"):
+            self._watch_workings_store()
         self._save_workspace()
 
     def _play_finish_sound(self, success):
@@ -696,7 +717,7 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
         self.browser_open_btn.configure(state="disabled", text="Opening browser...")
         def opened(session=None, error=None):
             self._opening_browser = False
-            self.browser_open_btn.configure(state="normal", text="Open background browser • sign in once")
+            self.browser_open_btn.configure(state="normal", text="Open separate browser · sign in once")
             if error:
                 self.log(f"Browser error: {error}")
                 self.status_label.configure(text=str(error), text_color="orange", wraplength=520)
@@ -718,17 +739,20 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
                 self.after(0, lambda message=str(error): opened(error=message))
         threading.Thread(target=launch, daemon=True).start()
 
+    def _ensure_homework_record(self):
+        """Never start a run that silently drops requested answer/workings records."""
+        if self.homework_store:
+            return True
+        self._new_homework_record()
+        if not self.homework_store:
+            self.status_label.configure(text="Create or open a homework record before starting, so answers and workings can be saved.", text_color="orange")
+            return False
+        return True
+
     def _on_start(self):
         if self._is_running:
             return
-        try:
-            max_q = int(self.limit_entry.get().strip())
-            if max_q < 1:
-                raise ValueError
-        except ValueError:
-            self.status_label.configure(text="New Qs must be a positive whole number.", text_color="orange")
-            self.log("Start cancelled: enter a positive number of new questions.")
-            return
+        max_q = None  # Discover the complete visible set instead of asking for a count.
         active_region, active_hwnd = self.selected_region, self.selected_hwnd
         if self.browser_var.get():
             if not self.browser_session:
@@ -759,8 +783,11 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
             right, bottom = left + self.winfo_width(), top + self.winfo_height()
             if (left < active_region["left"] + active_region["width"] and right > active_region["left"]
                     and top < active_region["top"] + active_region["height"] and bottom > active_region["top"]):
-                self.status_label.configure(text="Move the solver outside the homework area, or enable Separate browser in Configuration.", text_color="orange", wraplength=520)
+                self.status_label.configure(text="Move the solver outside the homework area, or select Separate browser on the Solver page.", text_color="orange", wraplength=520)
                 return
+
+        if not self._ensure_homework_record():
+            return
 
         # Initialize Planner according to chosen mode
         mode = self.mode_var.get()
@@ -783,7 +810,10 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
                 region=active_region,
                 target_hwnd=active_hwnd,
                 waiting_time=self.waiting_time if self.delay_var.get() else 0,
-                fast_submit=self.submit_var.get()
+                fast_submit=self.submit_var.get(),
+                bookwork=BookworkSession(self.observer, self.executor, self.homework_store, collect_workings=self.workings_var.get()),
+                require_bookwork=self.bookwork_var.get(),
+                submit_with_enter=True
             )
         except Exception as e:
             self.log(f"Planner Initialization Error: {e}")
@@ -824,7 +854,7 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
         if self.controller and getattr(self, "_notified_controller", None) is not self.controller:
             self._notified_controller = self.controller
             if self.sound_var.get() and reason != "Stopped by user":
-                self._play_finish_sound(self.controller.current_question_count >= self.controller.max_questions or reason.startswith("Page state: completed"))
+                self._play_finish_sound(not reason.startswith('Needs Human intervention') and (getattr(self.controller, '_bookwork_finish_passed', False) or reason.startswith('Finished all') or (not getattr(self.controller, 'auto_complete', False) and self.controller.current_question_count >= self.controller.max_questions) or reason.startswith('Page state: completed')))
         self.log(f"Run ended: {reason}")
         self.log("Autonomous answering loop finished. Full opacity restored.")
 

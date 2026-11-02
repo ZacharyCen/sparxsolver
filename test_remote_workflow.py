@@ -53,6 +53,49 @@ class RemoteWorkflowTests(unittest.TestCase):
         self.assertEqual(sum(call.args[0]["purpose"] == "next" for call in executor.execute.call_args_list), 4)
         self.assertIn("3/3 new questions", control.finish_reason)
 
+    def test_starting_on_answer_keypad_recovers_question_locally_once(self):
+        observer, planner, executor, bookwork = Mock(), Mock(), Mock(), Mock()
+        bookwork.handle.return_value = False
+        bookwork.solution = None
+        bookwork.code = '2A'
+        observer.capture_region.return_value = np.zeros((100,100,3),np.uint8)
+        observer.detect_correct_continue.return_value = None
+        observer.compute_frame_diff.side_effect = [0,.1]
+        def item(text, center):
+            x,y=center
+            return {'text':text,'center':center,'confidence':.99,'box':[[x-5,y-5],[x+5,y-5],[x+5,y+5],[x-5,y+5]]}
+        observer.extract_auxiliary_reference.side_effect = [
+            {'ocr_results':[item('Back',[20,80]),item('Enter number',[50,40]),item('Submitanswer',[80,80])]},
+            {'ocr_results':[]},
+        ]
+        executor.is_cancelled.return_value=False
+        planner.plan.return_value={'page_state':'question','action':{'type':'stop','reason':'Question recovered'}}
+        control=AutoAnswerController(observer,planner,executor,bookwork=bookwork,waiting_time=0)
+        control.start()
+        self.assertEqual(executor.execute.call_count,1)
+        self.assertEqual(executor.execute.call_args.args[0],{'type':'click','purpose':'answer','target':[20,80]})
+        self.assertEqual(planner.plan.call_count,1)
+        self.assertEqual(control.current_question_count,0)
+        self.assertEqual(control.finish_reason,'Question recovered')
+
+    def test_failed_question_recovery_cannot_cycle_back_forever(self):
+        observer, planner, executor, bookwork = Mock(), Mock(), Mock(), Mock()
+        bookwork.handle.return_value=False;bookwork.solution=None;bookwork.code='2A'
+        observer.capture_region.return_value=np.zeros((100,100,3),np.uint8)
+        observer.detect_correct_continue.return_value=None
+        observer.compute_frame_diff.side_effect=[0,.1]
+        observer.extract_auxiliary_reference.return_value={'ocr_results':[
+            {'text':'Back','center':[20,80],'confidence':.99,'box':[[15,75],[25,75],[25,85],[15,85]]},
+            {'text':'Enter number','center':[50,40]}, {'text':'Submit answer','center':[80,80]}]}
+        executor.is_cancelled.return_value=False
+        planner.plan.return_value={'page_state':'question','action':{'type':'click','purpose':'answer','target':[20,80]}}
+        control=AutoAnswerController(observer,planner,executor,bookwork=bookwork,waiting_time=0)
+        control.start()
+        self.assertEqual(executor.execute.call_count,1)
+        self.assertEqual(planner.plan.call_count,3)
+        self.assertIn('Repeated navigation',control.finish_reason)
+        self.assertEqual(control.current_question_count,0)
+
     def test_small_multipart_progress_is_not_compared_with_old_animation(self):
         observer, planner, executor = Mock(), Mock(), Mock()
         observer.capture_region.return_value = np.zeros((100, 100, 3), dtype=np.uint8)
@@ -153,12 +196,12 @@ class RemoteWorkflowTests(unittest.TestCase):
         planner.plan.return_value = {"page_state": "question", "ready_to_submit": True,
                                      "action": {"type": "type_text", "target": [50, 50], "text": "12"}}
         executor.is_cancelled.return_value = False
-        c = AutoAnswerController(observer, planner, executor, max_questions=1, waiting_time=0, fast_submit=True)
+        c = AutoAnswerController(observer, planner, executor, max_questions=1, waiting_time=0, fast_submit=True, submit_with_enter=True)
         c.start()
         planner.plan.assert_called_once()
         observer.verify_numeric_entry.assert_called_once()
         self.assertEqual(c.current_question_count, 1)
-        self.assertEqual([call.args[0]["type"] for call in executor.execute.call_args_list], ["type_text", "click", "click"])
+        self.assertEqual([call.args[0]["type"] for call in executor.execute.call_args_list], ["type_text", "press_enter", "click"])
 
     def test_intermediate_digit_never_triggers_fast_submit(self):
         observer, planner, executor = Mock(), Mock(), Mock()
@@ -281,15 +324,13 @@ class RemoteWorkflowTests(unittest.TestCase):
         self.assertEqual((params["x"], params["y"]), (100, 100))
         self.assertIsNone(session.pressed_point)
 
-    def test_invalid_run_limit_is_rejected_instead_of_defaulting_to_ten(self):
+    def test_start_does_not_require_a_manual_question_limit(self):
         from main import AutoAnswerApp
-        for value in ("", "text", "0", "-1"):
-            app = Mock()
-            app._is_running = False
-            app.limit_entry.get.return_value = value
-            AutoAnswerApp._on_start(app)
-            self.assertIn("positive whole number", app.status_label.configure.call_args.kwargs["text"])
-            app.hide_window.assert_not_called()
+        app=Mock();app._is_running=False;app.browser_var.get.return_value=True
+        app.browser_session=None;app._opening_browser=False
+        AutoAnswerApp._on_start(app)
+        app._open_background_browser.assert_called_once()
+        app.limit_entry.get.assert_not_called()
 
     def test_replacement_key_is_loaded_and_legacy_key_is_ignored(self):
         import os

@@ -41,6 +41,7 @@ class RetryTests(unittest.TestCase):
         planner = SimpleNamespace(reasoning_effort="low", question_memory="rejected", recent_steps=[], retry_context="")
         state = {"page": "answer", "question": 0}
         efforts = []
+        model_dismissals = []
         frame = np.full((600, 800, 3), 255, dtype=np.uint8)
         items = [{"text": "1A", "center": [200, 70]}, {"text": "1B", "center": [300, 70]}]
         def capture(region):
@@ -52,12 +53,14 @@ class RetryTests(unittest.TestCase):
             output = list(items)
             if state["page"] == "wrong":
                 output.append({"text": "Incorrect!", "center": [400, 550], "confidence": .99})
+                output.append({"text": "Try again", "center": [500, 550], "confidence": .99})
             return {"ocr_results": output}
         def plan(**kwargs):
             if state["question"]:
                 efforts.append(planner.reasoning_effort)
                 return {"action": {"type": "stop", "reason": "Next question reached"}}
             if state["page"] == "wrong":
+                model_dismissals.append(True)
                 return {"action": {"type": "click", "purpose": "answer", "target": [400, 500]}}
             efforts.append(planner.reasoning_effort)
             return {"action": {"type": "click", "purpose": "submit", "target": [700, 550]}}
@@ -87,8 +90,9 @@ class RetryTests(unittest.TestCase):
             self.assertEqual(rows[0]["wrong_answers"], 4)
             self.assertEqual(rows[0]["status"], "Needs Human intervention")
             self.assertTrue(Path(rows[0]["screenshot"]).exists())
+        self.assertFalse(model_dismissals, "Verified Try again should bypass the model")
         self.assertEqual(control.current_question_count, 0)
-        self.assertEqual(efforts[:4], ["low", "low", "high", "high"])
+        self.assertEqual(efforts[:4], ["low", "high", "high", "high"])
         return control, efforts
 
     def test_four_failures_escalate_log_skip_and_reset(self):
