@@ -11,6 +11,44 @@ from controller import AutoAnswerController
 
 
 class FinishTests(unittest.TestCase):
+    def test_passed_bookwork_ends_on_task_summary_without_searching_for_tabs(self):
+        from observer import Observer
+        obs,planner,ex,book=Mock(spec=Observer),Mock(),Mock(),Mock()
+        obs.capture_region.return_value=np.full((800,1000,3),255,np.uint8)
+        obs.task_completion.return_value={'correct':7,'total':7}
+        ex.is_cancelled.return_value=False
+        book.last_completed_at=0
+        def handle(*args):
+            book.last_completed_at=100
+            return True
+        book.handle.side_effect=handle
+        control=AutoAnswerController(obs,planner,ex,max_questions=None,bookwork=book,require_bookwork=True)
+        control.start()
+        self.assertTrue(control._bookwork_finish_passed)
+        self.assertEqual(control.finish_reason,'Finished all 7 questions; bookwork check passed')
+        obs.question_inventory.assert_not_called()
+        planner.plan.assert_not_called()
+
+    def test_continue_then_summary_are_both_opened_before_check(self):
+        control, obs, planner, ex, book = self.fixture()
+        state = {'page': 0}
+        frames = [np.full((800,1000,3), value, np.uint8) for value in (255,180,100)]
+        obs.capture_region.side_effect = lambda region: frames[state['page']].copy()
+        obs.compute_frame_diff.side_effect = lambda a,b: float(np.mean(cv2.absdiff(a,b)) / 255)
+        obs.detect_correct_continue.side_effect = lambda frame: [800,740] if state['page'] == 0 else None
+        ex.execute.side_effect = lambda action: state.update(page=state['page']+1)
+        ex.wait.side_effect = None
+        def handle(*args):
+            if state['page'] == 2:
+                book.last_completed_at = 100
+                book.completed_checks = 1
+                return True
+            return False
+        book.handle.side_effect = handle
+        control.start()
+        self.assertEqual(ex.execute.call_count, 2)
+        self.assertTrue(control._bookwork_finish_passed)
+
     def fixture(self, required=True, show_check=True):
         obs,planner,ex,book=Mock(),Mock(),Mock(),Mock()
         frame=np.full((800,1000,3),255,np.uint8)
@@ -103,6 +141,44 @@ class FinishTests(unittest.TestCase):
 
 
 class CardTests(unittest.TestCase):
+    def test_complete_task_summary_requires_count_title_and_navigation(self):
+        from observer import Observer
+        obs=Observer.__new__(Observer)
+        items=[{'text':'Task 2','center':[500,100]},
+               {'text':'7 out of 7 correct','center':[500,300]},
+               {'text':'Back to task list','center':[500,500]}]
+        obs.extract_auxiliary_reference=Mock(return_value={'ocr_results':items})
+        self.assertEqual(obs.task_completion(None),{'correct':7,'total':7})
+        items[1]['text']='6 out of 7 correct'
+        self.assertIsNone(obs.task_completion(None))
+        items[1]['text']='7 out of 7 correct'
+        items.pop(0)
+        self.assertIsNone(obs.task_completion(None))
+
+    def test_mixed_cards_keep_large_scalar_and_multipart_answers(self):
+        frame=np.full((1000,1400,3),255,np.uint8)
+        values=[('5','8'),('C','A','B'),('56',)]
+        for index,parts in enumerate(values):
+            x=100+index*300;y=250
+            cv2.rectangle(frame,(x,y),(x+250,y+200),(255,244,238),-1)
+            cv2.rectangle(frame,(x,y),(x+250,y+200),(200,190,180),2)
+            if len(parts)==1:
+                cv2.rectangle(frame,(x+50,y+25),(x+200,y+175),(255,255,255),-1)
+            else:
+                for slot in range(len(parts)):
+                    left=x+20+slot*75
+                    cv2.rectangle(frame,(left,y+60),(left+45,y+120),(255,255,255),-1)
+        reader=Mock(side_effect=[[value] for parts in values for value in parts])
+        result=BookworkDetector.vector_options(frame,100,reader)
+        self.assertIsNotNone(result)
+        options,complete,regions,selected=result
+        self.assertTrue(complete)
+        self.assertEqual([parts for parts,target in options],values)
+
+    def test_exact_surd_card_match(self):
+        self.assertTrue(matching_answer(('5+√10', '5-√10'), ('5+sqrt(10)', '5-sqrt(10)')))
+        self.assertFalse(matching_answer(('5+√11', '5-√11'), ('5+sqrt(10)', '5-sqrt(10)')))
+
     def test_image_cards_keep_complete_answers_together(self):
         frame=np.full((1000,1400,3),255,np.uint8)
         values=[('-0.14','2.73','-12.86','-22.73'),('-1','5','-5','1'),('11','56','-2','-9'),('1','5','4.6','-2.2'),('-1.33','1.67','-2.33','-2.33')]

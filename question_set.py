@@ -25,4 +25,10 @@ def read_inventory(frame, items):
     letters=[t['code'][-1] for t in tabs]
     if letters!=[chr(ord('A')+i) for i in range(len(tabs))]:return None
     if not any(x>tabs[-1]['target'][0] and abs(y-tabs[-1]['target'][1])<35 for x,y in summaries):return None
+    if len(tabs) > 1:
+        pitch = float(np.median(np.diff([tab['target'][0] for tab in tabs])))
+        # A missing final tab (especially 1I) must not shorten the detected set.
+        summary_x = min(x for x,y in summaries if x>tabs[-1]['target'][0] and abs(y-tabs[-1]['target'][1])<35)
+        if summary_x-tabs[-1]['target'][0] > pitch*2.05:
+            return None
     return tabs

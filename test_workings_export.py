@@ -25,6 +25,120 @@ def correct(store, value=None):
 
 
 class WorkingsTests(unittest.TestCase):
+    def test_homework_integer_powers_export_and_incorrect_equalities_still_fail(self):
+        workings = r'2^{15}=2\times 16384=32768'
+        self.assertEqual(validate_workings(workings,'32768'),workings)
+        with self.assertRaises(WorkingsError):
+            validate_workings(r'2^{15}=32767','32767')
+        with self.assertRaises(WorkingsError):
+            validate_workings(r'2^{100000}=32768','32768')
+
+    def test_checked_workings_save_to_documents_after_each_correct_answer(self):
+        from solver_ui import SolverUI
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            store = HomeworkStore.create('Homework / 1', directory)
+            events = []
+            exporter = WorkingsExporter(events.append)
+            ui = Mock()
+            ui.homework_store = store
+            ui._workings_store = None
+            ui.workings_var.get.return_value = True
+            ui._workings_exporter = exporter
+            with patch.object(WorkingsExporter, 'documents_folder', return_value=Path(directory)/'Documents'):
+                SolverUI._watch_workings_store(ui)
+                output = exporter.automatic_path(store.snapshot())
+                self.assertIn('Sparx Solver', str(output))
+                self.assertEqual(output.name,'workings.md')
+                correct(store)
+                correct(store,solution('1C','6','x=3+3=6'))
+                exporter.close(wait=True)
+            self.assertTrue(output.is_file())
+            self.assertIn('1B',output.read_text())
+            self.assertIn('1C',output.read_text())
+            self.assertTrue(output.with_suffix('.html').is_file())
+            self.assertTrue(list(output.with_name('workings_assets').glob('*.png')))
+            self.assertTrue(all(event['kind']=='automatic' and not event['error'] for event in events))
+
+    def test_automatic_paths_do_not_mix_assignments_with_the_same_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            a = HomeworkStore.create('Same title', directory)
+            b = HomeworkStore.create('Same title', directory)
+            with patch.object(WorkingsExporter, 'documents_folder', return_value=Path(directory)):
+                self.assertNotEqual(WorkingsExporter.automatic_path(a.snapshot()), WorkingsExporter.automatic_path(b.snapshot()))
+
+    def test_ordering_export_requires_readback_snapshot_and_correct_feedback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = HomeworkStore.create('Ordering', directory)
+            parts = [{'part':str(i), 'answer':answer, 'workings_latex':None}
+                     for i,answer in enumerate(('-7.8','-7.2','-4.4','-4','4.3','7.6'))]
+            store.save_proposal('2C', parts)
+            identifier = store.prepare('2C', '-7.8', {'question_code':'2C','parts':parts}, ordered=True)
+            self.assertFalse(build_report(store.snapshot()).ready)
+            store.set_status(identifier, 'pending')
+            store.set_status(identifier, 'correct')
+            report = build_report(HomeworkStore(store.path).snapshot())
+            self.assertEqual(report.ready, ['2C'])
+            self.assertIn(r'-7.8 \leq -7.2 \leq -4.4', report.markdown)
+            parts[0],parts[1] = parts[1],parts[0]
+            with self.assertRaises(ValueError):
+                store.prepare('2D', '-7.2', {'question_code':'2D','parts':parts}, ordered=True)
+
+    def test_preview_rendering_runs_on_worker_and_returns_png_bytes(self):
+        import threading
+        with tempfile.TemporaryDirectory() as directory:
+            store = HomeworkStore.create('Preview', directory)
+            correct(store)
+            events = []
+            current = threading.get_ident()
+            exporter = WorkingsExporter(lambda event: events.append((threading.get_ident(),event)))
+            exporter.preview(store.snapshot(), ('record',1)).result(timeout=15)
+            exporter.close(wait=True)
+            worker,event = events[-1]
+            self.assertNotEqual(current,worker)
+            self.assertEqual(event['kind'],'preview')
+            self.assertIsNone(event['error'])
+            self.assertTrue(all(image.startswith(b'\x89PNG') for image in event['images'].values()))
+
+    def test_rendered_export_is_portable_offline_and_contains_no_raw_tex(self):
+        import base64
+        import re
+        from io import BytesIO
+        from PIL import Image
+        with tempfile.TemporaryDirectory() as directory:
+            store = HomeworkStore.create('Rendered fractions', directory)
+            correct(store, solution(answer='.3', latex=r'\frac{7}{10}-\frac{2}{5}=\frac{3}{10}'))
+            events = []
+            exporter = WorkingsExporter(events.append)
+            output = Path(directory) / 'My workings.md'
+            exporter.schedule(store.snapshot(), store.path, output).result(timeout=15)
+            exporter.close(wait=True)
+            self.assertIsNone(events[-1]['error'])
+            markdown = output.read_text()
+            self.assertNotIn(r'\frac', markdown)
+            self.assertNotIn('$$', markdown)
+            target = re.search(r'!\[\]\(<(.+)>\)', markdown)[1]
+            with Image.open(output.parent / target) as image:
+                size = image.size
+                self.assertGreater(image.width, 80)
+                self.assertGreater(image.height, 40)
+            document = output.with_suffix('.html').read_text()
+            self.assertNotIn('<script', document)
+            self.assertNotIn(r'\frac', document)
+            embedded = base64.b64decode(re.search(r'base64,([^\"]+)', document)[1])
+            self.assertEqual(Image.open(BytesIO(embedded)).size, size)
+
+    def test_rendering_handles_supported_multiline_and_tex_commands(self):
+        from workings_render import equation_png
+        from PIL import Image
+        from io import BytesIO
+        for source in (r'x+2=7\implies x=7-2=5', r'\dfrac{1}{2}+\tfrac{1}{2}=1',
+                       r'2^r=\frac{1}{32}=2^{-5}\\r=-5', r'\sqrt{4}=2'):
+            with self.subTest(source=source):
+                image = Image.open(BytesIO(equation_png(source)))
+                self.assertEqual(image.format, 'PNG')
+                self.assertGreater(image.width, 40)
+
     def test_disabled_workings_keep_verified_bookwork_values(self):
         from bookwork import BookworkSession
         from unittest.mock import Mock
@@ -208,7 +322,9 @@ class WorkingsTests(unittest.TestCase):
             correct(store)
             exporter.close(wait=True)
             output = exporter.default_path(store.snapshot(), store.path)
-            self.assertEqual(output.read_text(), build_report(store.snapshot()).markdown)
+            self.assertIn('![](<', output.read_text())
+            self.assertNotIn('$$', output.read_text())
+            self.assertTrue(output.with_suffix('.html').is_file())
             self.assertTrue(events)
             self.assertTrue(all(event['error'] is None for event in events))
             store.on_change = None

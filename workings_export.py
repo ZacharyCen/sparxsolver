@@ -1,6 +1,7 @@
 """Restricted word-free LaTeX checks and atomic, local Markdown exports."""
 import ast
 import hashlib
+import math
 import json
 import uuid
 import os
@@ -13,6 +14,7 @@ from fractions import Fraction
 from pathlib import Path
 
 from bookwork import numeric_value
+from answer_values import expression_value
 
 
 class WorkingsError(ValueError):
@@ -91,7 +93,7 @@ def _expression(source):
         if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow)):
             operations += 1
             left, right = visit(node.left), visit(node.right)
-            if isinstance(node.op, ast.Pow) and right is not None and (right.denominator != 1 or abs(right) > 12):
+            if isinstance(node.op, ast.Pow) and right is not None and (right.denominator != 1 or abs(right) > 64):
                 raise WorkingsError('Only bounded integer powers are supported')
             if isinstance(node.op, ast.Div) and right == 0:
                 raise WorkingsError('Division by zero')
@@ -112,13 +114,14 @@ def _expression(source):
 
 
 def validate_workings(latex, answer):
-    """Check restricted syntax and the numeric result, not general symbolic proof."""
+    """Check restricted syntax and exact rational/surd results, not symbolic proofs."""
     if not isinstance(latex, str) or not latex.strip():
         raise WorkingsError('No workings were saved for this answer')
     if len(latex) > 2048 or re.search(r'[^A-Za-z0-9\\\s{}().+*/^=,;!|−–-]', latex):
         raise WorkingsError('Use only supported word-free mathematical notation')
-    if numeric_value(answer) is None:
-        raise WorkingsError('Numeric answer consistency is unsupported')
+    expected=expression_value(answer)
+    if expected is None:
+        raise WorkingsError('Answer expression consistency is unsupported')
     source = latex.strip().replace('−', '-').replace('–', '-')
     source = source.replace('\\\\', '|')
     translated = _translate(source)
@@ -133,9 +136,20 @@ def validate_workings(latex, answer):
             raise WorkingsError('Each step must contain a complete equality')
         relations += 1
         previous = None
+        previous_exact = None
         for side in sides:
             result, count = _expression(side)
             operations += count
+            exact=expression_value(side)
+            if previous_exact is not None and exact is not None and previous_exact!=exact:
+                if not approximate:
+                    raise WorkingsError('A mathematical equality in the working is incorrect')
+                digits=len(side.strip().split('.')[-1]) if '.' in side.strip() else 0
+                before=sum(float(coefficient)*math.sqrt(root) for root,coefficient in previous_exact)
+                after=sum(float(coefficient)*math.sqrt(root) for root,coefficient in exact)
+                if abs(before-after)>.5*10**(-digits)+1e-12:
+                    raise WorkingsError('An approximation in the working is incorrect')
+            previous_exact=exact
             if previous is not None and result is not None and previous != result:
                 digits = len(side.strip().split('.')[-1]) if '.' in side.strip() else 0
                 if not approximate or abs(previous-result) > Fraction(1, 2*10**digits):
@@ -143,8 +157,8 @@ def validate_workings(latex, answer):
             previous, final = result, result
     if not relations or not operations:
         raise WorkingsError('Include the essential calculation, not only the final answer')
-    if final is None or final != numeric_value(answer):
-        raise WorkingsError('The final numeric result does not match the verified answer')
+    if expression_value(sides[-1]) != expected:
+        raise WorkingsError('The final expression does not match the verified answer')
     return latex.strip()
 
 
@@ -184,8 +198,17 @@ def build_report(snapshot):
         parts = attempt.get('parts')
         if not isinstance(parts, list) or not parts:
             review.append((code, 'No saved workings snapshot')); continue
+        if attempt.get('kind') == 'ordering':
+            values = [numeric_value(part.get('answer')) for part in parts]
+            if len(values) < 3 or any(value is None for value in values) or not (values == sorted(values) or values == sorted(values, reverse=True)):
+                review.append((code, 'Saved ordering is not a supported numeric sequence')); continue
+            symbol = r' \leq ' if values == sorted(values) else r' \geq '
+            source = symbol.join(str(part['answer']) for part in parts)
+            sections.append(f'## {code}\n\n$$\n{source}\n$$\n')
+            ready.append(code)
+            continue
         try:
-            if numeric_value(parts[0].get('answer')) != numeric_value(attempt['answer']):
+            if expression_value(parts[0].get('answer')) != expression_value(attempt['answer']):
                 raise WorkingsError('Saved solution and submitted answer differ')
             sources = [validate_workings(part.get('workings_latex'), part['answer']) for part in parts]
         except (WorkingsError, TypeError, KeyError) as error:
@@ -225,36 +248,74 @@ class WorkingsExporter:
     def default_path(snapshot, record_path):
         return Path(record_path).parent / 'exports' / (str(uuid.UUID(snapshot['id'])) + '_workings.md')
 
-    def schedule(self, snapshot, record_path, destination=None):
-        kind = 'save' if destination is not None else 'checkpoint'
-        path = Path(destination) if destination is not None else self.default_path(snapshot, record_path)
+    @staticmethod
+    def documents_folder():
+        """Use the user's Documents folder, including redirected Windows folders."""
+        documents = Path.home() / 'Documents'
+        if os.name == 'nt':
+            import ctypes
+            buffer = ctypes.create_unicode_buffer(32768)
+            if ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buffer) == 0 and buffer.value:
+                documents = Path(buffer.value)
+        return documents
+
+    @staticmethod
+    def automatic_path(snapshot):
+        """Give each assignment its own stable, portable export folder."""
+        documents = WorkingsExporter.documents_folder()
+        name = re.sub(r'[^\w -]', '_', snapshot.get('name', 'Homework')).strip(' .')[:40] or 'Homework'
+        folder = name + '_' + str(uuid.UUID(snapshot['id']))
+        return documents / 'Sparx Solver' / 'Workings' / folder / 'workings.md'
+
+    def schedule(self, snapshot, record_path, destination=None, automatic=False):
+        kind = 'automatic' if automatic else 'save' if destination is not None else 'checkpoint'
+        path = self.automatic_path(snapshot) if automatic else Path(destination) if destination is not None else self.default_path(snapshot, record_path)
         signature = hashlib.blake2b(json.dumps({key: snapshot.get(key) for key in ('id','attempts','proposals','observed_codes')}, sort_keys=True).encode(), digest_size=16).digest()
         with self._lock:
-            if kind == 'checkpoint' and self._fingerprints.get(str(path)) == signature:
+            if kind != 'save' and self._fingerprints.get(str(path)) == signature:
                 return None
-            if kind == 'checkpoint': self._fingerprints[str(path)] = signature
+            if kind != 'save': self._fingerprints[str(path)] = signature
             return self._worker.submit(self._run, snapshot, path, kind, signature)
+
+    def preview(self, snapshot, token):
+        """Render away from Tk; the UI must never wait on the math renderer lock."""
+        def render():
+            from workings_render import equation_png
+            images, error = {}, None
+            try:
+                report = build_report(snapshot)
+                for source in re.findall(r'\$\$\n(.*?)\n\$\$', report.markdown, re.S):
+                    images[source] = equation_png(source)
+            except Exception as failure:
+                error = str(failure)
+            self.callback({'id': snapshot.get('id'), 'kind': 'preview', 'token': token,
+                           'images': images, 'error': error})
+        return self._worker.submit(render)
 
     def _run(self, snapshot, path, kind, signature):
         try:
             report = build_report(snapshot)
             if kind == 'save' and not report.ready:
                 raise WorkingsError('No verified workings are ready to save')
-            content=report.markdown
+            from workings_render import rendered_markdown, html_preview
+            directory = path.parent / (path.stem + '_assets')
+            content, image_data = rendered_markdown(report.markdown, directory.name)
             for source,name in report.assets:
-                directory=path.parent/(path.stem+'_assets');directory.mkdir(parents=True,exist_ok=True)
-                destination=directory/name
-                data=Path(source).read_bytes()
+                image_data[name] = Path(source).read_bytes()
+                content=content.replace(f'](assets/{name})',f'](<{directory.name}/{name}>)')
+            for name, data in image_data.items():
+                directory.mkdir(parents=True, exist_ok=True)
+                destination = directory / name
                 with tempfile.NamedTemporaryFile(dir=directory,delete=False,suffix='.tmp') as stream:
                     stream.write(data);temporary=Path(stream.name)
                 temporary.replace(destination)
-                content=content.replace(f'](assets/{name})',f'](<{directory.name}/{name}>)')
             empty = not report.ready
             # Do not advertise a new zero-byte document before any answer is ready.
             # If a checkpoint exists, clear its now-stale contents atomically.
             if not empty or path.exists():
+                atomic_write(path.with_suffix('.html'), html_preview(content, image_data))
                 atomic_write(path, content)
-            event = {'id': snapshot['id'], 'kind': kind, 'path': str(path), 'error': None, 'empty': empty}
+            event = {'id': snapshot['id'], 'kind': kind, 'path': str(path), 'preview_path': str(path.with_suffix('.html')), 'error': None, 'empty': empty}
         except Exception as error:
             with self._lock:
                 if self._fingerprints.get(str(path)) == signature:

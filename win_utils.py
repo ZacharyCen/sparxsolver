@@ -137,11 +137,23 @@ def activate_target_window(hwnd: int) -> bool:
 
     user32 = ctypes.windll.user32
     try:
+        user32.GetForegroundWindow.restype=wintypes.HWND
+        user32.GetAncestor.restype=wintypes.HWND
+        def owns_foreground():
+            foreground=user32.GetForegroundWindow()
+            return bool(foreground and (foreground==hwnd or
+                user32.GetAncestor(wintypes.HWND(foreground),3)==user32.GetAncestor(wintypes.HWND(hwnd),3)))
         # Restore if minimized
         if user32.IsIconic(wintypes.HWND(hwnd)):
             user32.ShowWindow(wintypes.HWND(hwnd), 9) # SW_RESTORE
 
-        if user32.GetForegroundWindow() == hwnd:
+        if owns_foreground():
+            return True
+
+        # A native expression dropdown belongs to the homework window. Preserve
+        # it, and try ordinary activation before sending a key that closes menus.
+        user32.SetForegroundWindow(wintypes.HWND(hwnd))
+        if owns_foreground():
             return True
 
         # Tap Alt only when a foreground change is actually required.
@@ -150,6 +162,6 @@ def activate_target_window(hwnd: int) -> bool:
         user32.keybd_event(VK_MENU, 0, 0, 0)
         user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
         user32.SetForegroundWindow(wintypes.HWND(hwnd))
-        return True
+        return owns_foreground()
     except Exception:
         return False

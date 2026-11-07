@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 
 from retry_policy import question_tabs
+from answer_values import expression_value, entry_matches
 
 
 class BookworkReview(RuntimeError):
@@ -20,6 +21,10 @@ def numeric_value(text):
     """Parse bounded exact numbers without eval, units, or floating point."""
     value = str(text).strip().replace('−', '-').replace('–', '-')
     if len(value) > 64 or not re.fullmatch(r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:\s*/\s*[+-]?\d+)?', value):
+        exact=expression_value(value)
+        if exact==():return Fraction(0)
+        if exact is not None and len(exact)==1 and exact[0][0]==1:
+            return exact[0][1]
         return None
     try:
         parts = value.replace(' ', '').split('/')
@@ -65,7 +70,103 @@ class BookworkDetector:
         if not self._gate_present:
             return None
         items = self.observer.extract_auxiliary_reference(frame).get('ocr_results', [])
-        return self.from_items(frame, items, self.observer._ocr, self._card_cache, self.observer.read_numeric_labels)
+        view = self.from_items(frame, items, self.observer._ocr, self._card_cache, self.read_answer_labels)
+        if view.code is None and view.status == 'select':
+            # The white-on-blue code badge is sometimes omitted by full-page
+            # OCR. Read that badge independently without guessing from answers.
+            badge = frame[int(height*.16):int(height*.40),int(width*.25):int(width*.75)]
+            hsv = cv2.cvtColor(badge,cv2.COLOR_BGR2HSV)
+            mask = cv2.inRange(hsv,(90,100,90),(130,255,255))
+            codes = set()
+            for contour in cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)[0]:
+                bx,by,bw,bh=cv2.boundingRect(contour)
+                if not (width*.025 < bw < width*.22 and 20 < bh < height*.08):
+                    continue
+                crop=badge[max(0,by-3):by+bh+3,max(0,bx-3):bx+bw+3]
+                raw,_=self.observer._ocr(cv2.resize(crop,None,fx=3,fy=3))
+                text=' '.join(str(label) for _,label,confidence in raw or [] if confidence>=.85)
+                match=re.fullmatch(r'\s*book\s*work\s*(\d{1,3})\s*([A-Z])\s*',text,re.I)
+                if match:codes.add(match[1]+match[2].upper())
+            if len(codes)==1:view.code=codes.pop()
+        return view
+
+    def read_answer_labels(self, crop):
+        """Keep stacked fractions and square roots intact inside bookwork cards."""
+        fraction = self.observer.read_stacked_fraction(crop)
+        if fraction is not None:
+            return [fraction]
+        ink = cv2.inRange(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), 0, 160)
+        boxes = [cv2.boundingRect(c) for c in cv2.findContours(ink, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]]
+        height, width = crop.shape[:2]
+        # OCR often omits the radical and reads its raised radicand first.
+        # Require the actual connected hook/roof and read its two sides apart.
+        radicals = [(x,y,w,h) for x,y,w,h in boxes
+                    if y < height*.35 and h > height*.4 and w > height*.6
+                    and w > h*1.05]
+        if len(radicals) == 1:
+            x,y,w,h = radicals[0]
+            digits = [(a,b,c,d) for a,b,c,d in boxes if a > x+w*.3 and a+c <= x+w+1 and b > y]
+            signs = [(a,b,c,d) for a,b,c,d in boxes if a+c < x and a > width*.15
+                     and (c > d*3 or abs(c-d) < max(3,d*.25))]
+            if digits:
+                a = min(b[0] for b in digits)
+                b = min(b[1] for b in digits)
+                root = self.observer.read_numeric_labels(crop[b:y+h+1, a:x+w+1])
+                if len(root)>1 and all(re.fullmatch(r'\d+',label) for label in root):
+                    # A confirmed radical's integer may be split into separate
+                    # digit detections. Reassemble spatially, never OCR order.
+                    field=crop[b:y+h+1,a:x+w+1]
+                    padded=cv2.copyMakeBorder(cv2.resize(field,None,fx=2,fy=2),16,16,16,16,
+                                             cv2.BORDER_CONSTANT,value=(255,255,255))
+                    raw,_=self.observer._ocr(padded,use_cls=False)
+                    tokens=[]
+                    for points,text,confidence in raw or []:
+                        if confidence>=.8:
+                            points=np.asarray(points)
+                            tokens.append((str(text).strip(),points.min(axis=0),points.max(axis=0)))
+                    unique=[]
+                    for index,token in enumerate(tokens):
+                        text,left,right=token
+                        tolerance=max(4,(right[1]-left[1])*.2)
+                        covered=any(other!=index and ((len(word)>len(text) and text in word) or (word==text and other<index))
+                                    and (start[0]<=left[0]+tolerance and end[0]>=right[0]-tolerance
+                                         or len(word)>len(text) and min(end[0],right[0])-max(start[0],left[0])
+                                             >min(end[0]-start[0],right[0]-left[0])*.55)
+                                    and min(end[1],right[1])-max(start[1],left[1])>min(end[1]-start[1],right[1]-left[1])*.5
+                                    for other,(word,start,end) in enumerate(tokens))
+                        if not covered:unique.append(token)
+                    unique.sort(key=lambda item:item[1][0])
+                    separate=all(after[1][0]>=before[2][0]-max(2,min(before[2][0]-before[1][0],
+                                                                                   after[2][0]-after[1][0])*.2)
+                                 for before,after in zip(unique,unique[1:]))
+                    if (unique and all(re.fullmatch(r'\d+',text) for text,_,_ in unique)
+                            and separate
+                            and max((left[1]+right[1])/2 for _,left,right in unique)
+                                -min((left[1]+right[1])/2 for _,left,right in unique)<field.shape[0]*.8):
+                        root=[''.join(text for text,_,_ in sorted(unique,key=lambda item:item[1][0]))]
+                if len(root) == 1 and re.fullmatch(r'\d+', root[0]):
+                    prefix = [(a,b,c,d) for a,b,c,d in boxes if a+c < x]
+                    radical = 'sqrt(' + root[0] + ')'
+                    if not prefix:
+                        return [radical]
+                    if len(prefix) == 1 and prefix[0][2] > prefix[0][3]*3:
+                        return ['-' + radical]
+                    if len(signs) == 1:
+                        sx,sy,sw,sh = signs[0]
+                        left = self.read_answer_labels(crop[:, :sx-2])
+                        if len(left) == 1 and numeric_value(left[0]) is not None:
+                            return [left[0] + ('-' if sw > sh*3 else '+') + radical]
+            return []  # Never reinterpret an unreadable radical as ordinary digits.
+        labels = self.observer.read_numeric_labels(crop)
+        if len(labels) > 1:
+            # A detached minus is sometimes returned as a Chinese horizontal stroke.
+            ordered = sorted(boxes)
+            if len(ordered) >= 2 and ordered[0][2] > ordered[0][3]*3:
+                digits = [label for label in labels if re.fullmatch(r'\d+(?:\.\d+)?', label)]
+                if len(digits) == 1 and all(label in digits or label in ('一','-','−') for label in labels):
+                    return ['-' + digits[0]]
+            return []  # Token order alone is not mathematical layout.
+        return labels
 
     @staticmethod
     def from_items(frame, items, ocr=None, card_cache=None, numeric_reader=None):
@@ -76,12 +177,15 @@ class BookworkDetector:
         if not titles:
             return BookworkView(None, [])  # Suspected check stays out of ordinary solving.
         title_y = min(item['center'][1] for item in titles)
-        codes = set()
+        codes, explicit_codes = set(), set()
         for item in items:
             if title_y - 15 <= item['center'][1] < title_y + height * .3:
+                explicit_codes.update(number+letter for number,letter in re.findall(
+                    r'BOOK\s*WORK\s*(\d{1,3})\s*([A-Z])(?![A-Z0-9])',item['text'].upper()))
                 codes.update(re.findall(r'(?<!\d)\d{1,3}[A-Z](?![A-Z0-9])', item['text'].upper()))
+        if explicit_codes:codes=explicit_codes
         code = next(iter(codes)) if len(codes) == 1 else None
-        words = {item['text'].strip().lower().rstrip('!.'): item['center'] for item in items if item['center'][1] >= title_y}
+        words = {item['text'].strip().lower().rstrip('!. >›»→'): item['center'] for item in items if item['center'][1] >= title_y}
         status = 'rejected' if any(word in words for word in ('incorrect', 'try again', 'not quite', 'failed')) else 'select'
         if any(word in words for word in ('correct', 'passed', 'bookwork check passed', 'check passed', 'bookwork check complete', 'well done', 'correct answer')):
             status = 'accepted'
@@ -107,7 +211,7 @@ class BookworkDetector:
         options = []
         seen = set()
         for item in items:
-            if numeric_value(item['text']) is None:
+            if expression_value(item['text']) is None:
                 continue
             px, py = map(int, item['center'])
             if py <= title_y or not width * .08 < px < width * .92:
@@ -141,7 +245,7 @@ class BookworkDetector:
                             if len(card_cache) >= 24:
                                 card_cache.clear()
                             card_cache[key] = labels
-                    if len(labels) != 1 or numeric_value(labels[0]) is None:
+                    if len(labels) != 1 or expression_value(labels[0]) is None:
                         complete = False
                     else:
                         options.append((labels[0], [int(l+w/2), int(t+h/2)]))
@@ -179,7 +283,7 @@ class BookworkDetector:
             fields=[]
             for contour in cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)[0]:
                 l,t,fw,fh=cv2.boundingRect(contour)
-                if 18 < fw < bw*.55 and 20 < fh < bh*.45 and l>1 and t>1:
+                if 18 < fw < bw*.80 and 20 < fh < bh*.80 and l>1 and t>1:
                     fields.append((l,t,fw,fh))
             if not fields:
                 return None  # Ordinary scalar cards use the existing scalar path.
@@ -187,8 +291,10 @@ class BookworkDetector:
             for l,t,fw,fh in sorted(fields,key=lambda box:(round((box[1]+box[3]/2)/20),box[0])):
                 field=card[t+2:t+fh-2,l+2:l+fw-2]
                 labels=reader(255-field if dark else field)
-                if len(labels)==1 and numeric_value(labels[0]) is not None:
+                if len(labels)==1 and expression_value(labels[0]) is not None:
                     values.append(labels[0])
+                elif len(labels)==1 and re.fullmatch(r'[A-Za-z]',labels[0]):
+                    values.append(labels[0].upper())  # Recognized letter distractors cannot match numeric answers.
                 elif len(labels)==1 and labels[0].strip().lower() == 'have':
                     continue  # A proof acknowledgement is not a fifth numeric answer.
                 else:
@@ -208,8 +314,8 @@ def matching_answer(option, expected):
     """Match exact numbers; simultaneous-equation root pairs may be displayed in either order."""
     values=option if isinstance(option,(tuple,list)) else (option,)
     if len(values)!=len(expected):return False
-    actual=tuple(numeric_value(value) for value in values)
-    wanted=tuple(numeric_value(value) for value in expected)
+    actual=tuple(expression_value(value) for value in values)
+    wanted=tuple(expression_value(value) for value in expected)
     if None in actual or None in wanted:return False
     if len(actual)==4:
         return sorted((actual[:2],actual[2:])) == sorted((wanted[:2],wanted[2:]))
@@ -223,12 +329,35 @@ def reliable_options(view, expected):
         if not isinstance(values,tuple):return False
         if None not in values:continue
         if len(values)!=len(expected):return False
-        actual=tuple(numeric_value(value) if value is not None else None for value in values)
-        wanted=tuple(numeric_value(value) for value in expected)
+        actual=tuple(expression_value(value) if value is not None else None for value in values)
+        wanted=tuple(expression_value(value) for value in expected)
         orders=(wanted,wanted[2:]+wanted[:2]) if len(wanted)==4 else (wanted,)
         if any(all(a is None or a==b for a,b in zip(actual,order)) for order in orders):
             return False
     return True
+
+
+def stable_bookwork_controls(previous, current, expected):
+    """Allow small OCR/hover shifts while keeping the same unique answer card."""
+    if current is None or previous.code != current.code or previous.status != current.status:
+        return False
+    def near(a,b):
+        return a is None and b is None or a is not None and b is not None and max(abs(x-y) for x,y in zip(a,b))<=4
+    if not near(previous.control,current.control):
+        return False
+    if current.status != 'select':
+        return previous.identity == current.identity
+    if not reliable_options(current,expected) or len(previous.options)!=len(current.options):
+        return False
+    old_matches=[target for values,target in previous.options if matching_answer(values,expected)]
+    new_matches=[target for values,target in current.options if matching_answer(values,expected)]
+    if len(old_matches)!=1 or len(new_matches)!=1 or not near(old_matches[0],new_matches[0]):
+        return False
+    # Tolerate a differently read distractor, never reordered or moved cards.
+    old_targets=[target for _,target in previous.options]
+    new_targets=[target for _,target in current.options]
+    return (all(sum(near(a,b) for b in new_targets)==1 for a in old_targets)
+            and all(sum(near(a,b) for a in old_targets)==1 for b in new_targets))
 
 
 class BookworkSession:
@@ -247,11 +376,11 @@ class BookworkSession:
         self.last_completed_at = 0.0
 
     def bind_question(self, frame, items):
-        code, _ = question_tabs(frame, [item for item in items if item.get('confidence', 1) >= .80])
-        if not code:
-            from observer import Observer
-            if isinstance(self.observer, Observer):
-                code = self.observer.read_question_code(frame)
+        from observer import Observer
+        if isinstance(self.observer,Observer):
+            code=self.observer.read_question_code(frame)
+        else:
+            code, _ = question_tabs(frame, [item for item in items if item.get('confidence', 1) >= .80])
         if code and code != self.code:
             if self.pending:
                 raise BookworkReview('Question changed while its saved submission outcome is unresolved')
@@ -273,14 +402,13 @@ class BookworkSession:
                     part['workings_latex'] = None
         # Navigation responses may repeat the answer with null workings. Keep the
         # calculation accepted during this attempt, never across a changed answer.
-        if (self.collect_workings and self.solution and isinstance(parts, list) and len(parts) == 1
-                and parts[0].get('part') == '' and not parts[0].get('workings_latex')):
-            previous = self.solution['parts'][0]
-            incoming = str(parts[0].get('answer', '')).strip()
-            assignment = re.fullmatch(r'[A-Za-z]\s*=\s*(.+)', incoming)
-            incoming = assignment[1].strip() if assignment else incoming
-            if numeric_value(incoming) is not None and numeric_value(incoming) == numeric_value(previous['answer']):
-                parts[0]['workings_latex'] = previous.get('workings_latex')
+        if (self.collect_workings and self.solution and isinstance(parts,list)
+                and len(parts)==len(self.solution['parts'])):
+            for incoming,previous in zip(parts,self.solution['parts']):
+                if (isinstance(incoming,dict) and not incoming.get('workings_latex')
+                        and expression_value(incoming.get('answer')) is not None
+                        and expression_value(incoming['answer'])==expression_value(previous['answer'])):
+                    incoming['workings_latex']=previous.get('workings_latex')
         if self.store and self.store._valid_parts(parts):
             try:
                 self.store.save_proposal(self.code, parts)
@@ -294,7 +422,7 @@ class BookworkSession:
             assignment = re.fullmatch(r'[A-Za-z]\s*=\s*(.+)', answer)
             if assignment:
                 answer = assignment[1].strip()
-            if numeric_value(answer) is None:
+            if expression_value(answer) is None:
                 self.solution = self.entry = None
                 return False
             part['answer'] = answer
@@ -302,26 +430,55 @@ class BookworkSession:
         return True
 
     def verified_fields(self, frame):
-        """Require every visible numeric field to match the complete saved solution."""
+        """Reuse one readback for identical pixels and the same solution."""
+        from observer import Observer
+        if self.solution and isinstance(self.observer,Observer) and isinstance(frame,np.ndarray):
+            key=(self.code,tuple(part['answer'] for part in self.solution['parts']),frame.shape,
+                 hashlib.blake2b(frame.tobytes(),digest_size=16).digest())
+            cache=getattr(self,'_field_readbacks',{})
+            if key in cache:
+                return cache[key]
+            result=self._read_verified_fields(frame)
+            if len(cache)>=4:cache.clear()
+            cache[key]=result
+            self._field_readbacks=cache
+            return result
+        return self._read_verified_fields(frame)
+
+    def _read_verified_fields(self, frame):
+        """Match every complete numeric or expression field to the saved solution."""
         if not self.solution:
             return None
-        fields = self.observer.numeric_fields(frame)
         parts = self.solution['parts']
+        from observer import Observer
+        if isinstance(self.observer,Observer):
+            choices=self.observer.numeric_choice_state(frame,[part['answer'] for part in parts])
+            if choices is not None:
+                return choices['cards'] if choices['complete'] else None
+        fields = (self.observer.answer_fields(frame,[part['answer'] for part in parts])
+                  if isinstance(self.observer,Observer) else self.observer.numeric_fields(frame))
         if len(fields) != len(parts):
             return None
-        if all(numeric_value(field['value']) == numeric_value(part['answer']) for field,part in zip(fields,parts)):
+        if all(entry_matches(field['value'],part['answer']) for field,part in zip(fields,parts)):
             return fields
         return None
 
     def next_entry(self, frame, keypad=False):
         """Locate one unfinished slot locally; leave unfamiliar layouts to the model."""
+        self.last_entry_completes = False
         if not self.solution:
             return None
+        if any(not re.fullmatch(r'-?\d+(?:\.\d+)?',part['answer']) for part in self.solution['parts']):
+            return None  # Fractions and expressions need their actual mathematical controls.
         fields = self.observer.numeric_fields(frame)
         if len(fields) != len(self.solution['parts']):
             return None
+        if any(field.get('kind') == 'ordered_card' for field in fields):
+            return None  # Reordering needs a drag, never keyboard entry into a card.
+        self.last_entry_completes = sum(not entry_matches(field['value'],part['answer'])
+                                        for field,part in zip(fields,self.solution['parts'])) == 1
         for field,part in zip(fields,self.solution['parts']):
-            if numeric_value(field['value']) != numeric_value(part['answer']):
+            if not entry_matches(field['value'],part['answer']):
                 if keypad:
                     keys = self.observer.keypad_controls(frame)
                     if not field.get('focused'):
@@ -363,7 +520,7 @@ class BookworkSession:
         else:
             raw, _ = self.observer._ocr(crop)
             values = [str(text).strip() for _, text, confidence in raw or [] if confidence >= .85]
-        return len(values) == 1 and numeric_value(values[0]) == numeric_value(expected)
+        return len(values) == 1 and entry_matches(values[0],expected)
 
     def observe_entry(self, action, frame):
         if action.get('type') in ('type_text', 'fill') and self.solution and len(self.solution['parts']) == 1:
@@ -374,11 +531,32 @@ class BookworkSession:
         if action.get('purpose') != 'submit' and action.get('type') != 'wait':
             self.entry = None
 
-    def prepare_submission(self, frame):
+    def visual_choice_readback(self, frame):
+        """Keep image evidence for expression cards OCR cannot verify; never invent values."""
+        from observer import Observer
+        if not self.solution or not isinstance(self.observer, Observer):
+            return None
+        cards = self.observer.numeric_choice_cards(frame)
+        if not cards or not 3 <= len(cards) <= 16:
+            return None
+        selected = [card for card in cards if card['selected']]
+        if len(selected) != len(self.solution['parts']) or not all(card.get('bounds') for card in cards):
+            return None
+        left = min(card['bounds'][0] for card in cards)
+        top = min(card['bounds'][1] for card in cards)
+        right = max(card['bounds'][0]+card['bounds'][2] for card in cards)
+        bottom = max(card['bounds'][1]+card['bounds'][3] for card in cards)
+        return frame[top:bottom,left:right].copy()
+
+    def prepare_submission(self, frame, visual_choices=None, trust_entry=False):
         if not self.store:
             return None
         if self.pending:
             raise BookworkReview('A saved submission is still awaiting grading; it will not be submitted again')
+        if visual_choices is not None:
+            if self.observer.read_question_code(frame) != self.code:
+                raise BookworkReview('Visual choice submission question code could not be verified')
+            return self.store.prepare_visual(self.code, visual_choices, self.visual_parts or self.solution['parts'])
         if not self.solution:
             from observer import Observer
             if self.collect_workings and self.code and isinstance(self.observer,Observer):
@@ -389,22 +567,27 @@ class BookworkSession:
                     return self.store.prepare_visual(code,diagram,self.visual_parts)
             return None
         # Multi-field submissions must be read in full, including the final decimal.
-        fields = self.verified_fields(frame)
-        if fields is None and (len(self.solution['parts']) != 1 or not self.entry):
+        if trust_entry and any(not re.fullmatch(r'-?\d+(?:\.\d+)?',part['answer']) for part in self.solution['parts']):
+            raise BookworkReview('Fast entry intent supports plain numeric fields only')
+        fields = None if trust_entry else self.verified_fields(frame)
+        if not trust_entry and fields is None and (len(self.solution['parts']) != 1 or not self.entry):
             raise BookworkReview('Entered answers do not match the saved solution; submission was blocked')
-        items = self.observer.extract_auxiliary_reference(frame).get('ocr_results', [])
-        code, _ = question_tabs(frame, [item for item in items if item.get('confidence', 1) >= .80])
-        if not code:
-            from observer import Observer
-            if isinstance(self.observer, Observer):
-                code = self.observer.read_question_code(frame)
+        from observer import Observer
+        if isinstance(self.observer,Observer):
+            code=self.observer.read_question_code(frame)
+        else:
+            items = self.observer.extract_auxiliary_reference(frame).get('ocr_results', [])
+            code, _ = question_tabs(frame, [item for item in items if item.get('confidence', 1) >= .80])
         if code != self.code:
             raise BookworkReview('Submission question code could not be verified')
         answer = self.solution['parts'][0]['answer']
-        if fields is None and not self.verify_entry(frame, self.entry[0], answer):
+        if not trust_entry and fields is None and not self.verify_entry(frame, self.entry[0], answer):
             raise BookworkReview('Entered answer could not be verified')
         try:
-            return self.store.prepare(code, answer, solution=self.solution)
+            if any(numeric_value(part['answer']) is None for part in self.solution['parts']):
+                return self.store.prepare_expression(code,self.solution)
+            return self.store.prepare(code, answer, solution=self.solution,
+                                      ordered=bool(fields and all(field.get('kind') == 'ordered_card' for field in fields)))
         except (OSError, ValueError) as error:
             raise BookworkReview(f'Homework record could not save submission intent: {error}') from error
 
@@ -420,16 +603,16 @@ class BookworkSession:
         if self.pending and correct:
             if frame is None:
                 raise BookworkReview('Correct feedback needs a fresh question identity before saving')
-            raw, _ = self.observer._ocr(frame[:int(frame.shape[0] * .35)])
-            items = []
-            for points, text, confidence in raw or []:
-                if confidence >= .80:
-                    items.append({'text': text, 'center': np.mean(points, axis=0).tolist()})
-            current_code, _ = question_tabs(frame, [item for item in items if item.get('confidence', 1) >= .80])
-            if not current_code:
-                from observer import Observer
-                if isinstance(self.observer, Observer):
-                    current_code = self.observer.read_question_code(frame)
+            from observer import Observer
+            if isinstance(self.observer,Observer):
+                current_code=self.observer.read_question_code(frame)
+            else:
+                raw, _ = self.observer._ocr(frame[:int(frame.shape[0] * .35)])
+                items = []
+                for points, text, confidence in raw or []:
+                    if confidence >= .80:
+                        items.append({'text': text, 'center': np.mean(points, axis=0).tolist()})
+                current_code, _ = question_tabs(frame, [item for item in items if item.get('confidence', 1) >= .80])
             if current_code != self.pending[1]:
                 raise BookworkReview('Correct feedback could not be bound to the submitted question code')
         if self.pending:
@@ -456,23 +639,35 @@ class BookworkSession:
         view = self.detector.inspect(frame)
         if view is None:
             return False
+        for _ in range(2):
+            if view.code or view.status != 'select':
+                break
+            if self.executor.is_cancelled():
+                return True
+            self.executor.wait(150)
+            frame=capture()
+            view=self.detector.inspect(frame,force=True) or BookworkView(None,[])
         pending = self.store.data.get('bookwork_pending') if self.store else None
         resume_accepted = bool(view.status == 'accepted' and pending and pending['phase'] in ('confirmed','accepted'))
         check_code = view.code or (pending['code'] if resume_accepted else None)
         if not self.store or not check_code:
             raise BookworkReview('Bookwork check needs a selected homework record and a readable question code')
-        expected = self.store.verified_values(check_code)
+        expected = self.store.verified_check_values(check_code)
         if not expected:
-            raise BookworkReview(f'No complete verified numeric answer saved for {check_code} in this homework')
+            raise BookworkReview(f'No verified answer saved for Bookwork {check_code}. This question may have been completed before recording started; enter its answer manually in the browser. No choice was guessed.')
         answer = ', '.join(expected)
-        if pending and not resume_accepted:
+        resume_selected = bool(pending and pending['code']==check_code and pending['phase']=='selected'
+                               and view.selected and reliable_options(view,expected)
+                               and sum(matching_answer(values,expected) for values,_ in view.options)==1
+                               and any(target==view.selected and matching_answer(values,expected) for values,target in view.options))
+        if pending and not (resume_accepted or resume_selected):
             raise BookworkReview("A previous bookwork action is unresolved. Inspect the browser, then use Review pending before retrying")
         original_code = check_code
         selected = confirmed = accepted = continued = False
         selected_target = None
         selected_appearance = None
         selection_slice = None
-        intent_saved = resume_accepted
+        intent_saved = resume_accepted or resume_selected
         last_frame = frame
         deadline = time.monotonic() + 40
         if view.selected and any(target==view.selected and matching_answer(values,expected) for values,target in view.options):
@@ -482,7 +677,7 @@ class BookworkSession:
             selection_slice=(slice(sy,sy+sh),slice(sx,sx+sw))
             selected_appearance=frame[selection_slice].copy()
             print('[Bookwork] Saved answer is already visibly selected; verifying before confirmation.')
-        for _ in range(8):
+        while time.monotonic() <= deadline:
             if self.executor.is_cancelled():
                 return True
             if view is None:
@@ -527,8 +722,20 @@ class BookworkSession:
                     activate()
                 fresh = capture()
                 fresh_view = self.detector.inspect(fresh, force=True)
-                if fresh_view is None or (fresh_view.status == 'select' and not reliable_options(fresh_view,expected)) or fresh_view.identity != view.identity or fresh_view.status != view.status or fresh_view.control != view.control:
+                for _ in range(2):
+                    if stable_bookwork_controls(view,fresh_view,expected):
+                        break
+                    if self.executor.is_cancelled():
+                        return True
+                    self.executor.wait(100)
+                    fresh=capture()
+                    fresh_view=self.detector.inspect(fresh,force=True)
+                if not stable_bookwork_controls(view,fresh_view,expected):
                     raise BookworkReview('Bookwork controls changed before input; re-observe before retrying')
+                if accepted or confirmed:
+                    target=fresh_view.control
+                else:
+                    target=next(position for values,position in fresh_view.options if matching_answer(values,expected))
                 x, y = target
                 if not 0 <= x < fresh.shape[1] or not 0 <= y < fresh.shape[0]:
                     raise BookworkReview('Bookwork target is outside the captured region')
@@ -537,7 +744,9 @@ class BookworkSession:
                 if confirmed and not accepted and selected_appearance is not None:
                     sx, sy = selected_target
                     patch = fresh[selection_slice]
-                    if patch.shape != selected_appearance.shape or np.mean(cv2.absdiff(patch, selected_appearance)) > 1:
+                    visibly_selected=(fresh_view.selected is not None and
+                                      max(abs(a-b) for a,b in zip(fresh_view.selected,selected_target))<=4)
+                    if not visibly_selected and (patch.shape != selected_appearance.shape or np.mean(cv2.absdiff(patch, selected_appearance)) > 1):
                         raise BookworkReview('The selected bookwork card changed before confirmation')
                 if not intent_saved:
                     self._check_store('begin_check', original_code)

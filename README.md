@@ -37,7 +37,7 @@ Use **Workings → Save Markdown** to receive a local `.md` file, **Copy LaTeX**
 
 Only the latest verified submitted snapshot with supported workings is exported. Navigation responses cannot erase an existing calculation by returning null workings; a run started on an empty answer keypad may return to read the hidden question once. The page shows captured-question coverage and reasons for review, including older answers without saved workings and unsupported visual tasks. Numeric multipart questions are saved only after every visible answer field matches the complete solution and the submission is graded correct. The numeric checks verify supported syntax, arithmetic equalities, and the final submitted value; they do not prove arbitrary symbolic derivations.
 
-Checkpoints update outside the repository and remain available after stopping. Save As writes a consistent copy in the background. This release displays LaTeX source; rendered mathematical preview and PDF are later steps.
+Checkpoints update outside the repository and remain available after stopping. Save As writes a consistent copy in the background. The Workings page renders equations directly. Markdown exports use equation images in an accompanying assets folder, and each export includes a standalone `.html` copy with embedded images for offline viewing and browser printing. Use **Open preview** to view it. **Copy workings** retains the LaTeX source for mathematical editors.
 
 ## Model configuration
 
@@ -48,6 +48,8 @@ Saved single- and multi-select letter answers are matched to the current buttons
 Numeric entry uses local field readback and a recognized keypad layout to avoid a model call per digit. Decimal points and all answer fields are checked before submission. Repeated waits, Back/Answer oscillation, and failed readback stop with an explicit review reason.
 
 After the first confirmed incorrect submission on a question, reasoning increases to high. After four total failures, the assistant saves a “Needs Human intervention” record and screenshot, then attempts a verified move to the next question. Skips do not count as correct answers. Open review logs from Configuration.
+
+Fraction and surd answer slots retain complete expressions such as `-7/3` and `5+sqrt(10)`. Readback compares exact supported expressions, including formatted fraction fields and expression dropdowns. Answer-format failures trigger up to two high-reasoning replans; unresolved entries are saved for review and skipped when the next tab can be verified. Ordinary model blockers do not immediately end the entire set. Login, connection, cancellation, and unconfirmed-submission protections remain active.
 
 ## Verification
 

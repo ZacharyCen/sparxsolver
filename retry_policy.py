@@ -107,3 +107,42 @@ class RecoveryGuard:
         elif kind not in ('wait', 'stop'):
             self.navigation.clear()
         return self.waits >= 4 or (len(self.navigation) >= 6 and len(set(self.navigation)) <= 2)
+
+
+class InteractionGuard:
+    """Bound repeating control sequences even when dropdowns animate or OCR is skipped."""
+    def __init__(self, point_tolerance=24):
+        self.history = []
+        self.actions = 0
+        self.points = []
+        self.point_tolerance = point_tolerance
+
+    def observe(self, action):
+        kind = action.get('type')
+        if kind in ('stop', 'wait') or action.get('purpose') in ('submit', 'next', 'skip', 'auto_tab'):
+            return None
+        def point(name):
+            values = tuple(action.get(name, []))
+            if len(values) != 2:
+                return values
+            for previous in self.points:
+                if max(abs(a-b) for a,b in zip(values,previous)) <= self.point_tolerance:
+                    return previous
+            self.points.append(values)
+            return values
+        signature = (kind, point('target'), point('start'), point('end'),
+                     action.get('text'), action.get('direction'), action.get('steps'))
+        self.actions += 1
+        self.history = (self.history + [signature])[-16:]
+        if (len(self.history) >= 12 and all(item[0] == 'click' for item in self.history[-12:])
+                and len(set(self.history[-12:])) <= 3):
+            return 'Twelve clicks cycling among the same three controls without a confirmed submission'
+        for period in range(1, 5):
+            repeats = 6 if period == 1 else 4
+            if len(self.history) >= period * repeats:
+                tail = self.history[-period*repeats:]
+                if tail == tail[-period:] * repeats:
+                    return f'The same control sequence repeated {"six" if repeats == 6 else "four"} times without a confirmed submission'
+        if self.actions >= 60:
+            return 'Sixty answer-control actions without a confirmed submission'
+        return None

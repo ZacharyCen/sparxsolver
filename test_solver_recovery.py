@@ -21,6 +21,42 @@ def multipart():
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_blue_keypad_buttons_are_not_extra_answer_fields(self):
+        from observer import Observer
+        observer=Observer.__new__(Observer)
+        frame=np.full((800,1200,3),255,np.uint8)
+        for x in (350,650):
+            cv2.rectangle(frame,(x,280),(x+180,340),(210,210,210),2)
+        for row in range(4):
+            for column in range(3):
+                x,y=580+column*100,390+row*65
+                cv2.rectangle(frame,(x,y),(x+90,y+50),(248,236,220),-1)
+        observer.read_numeric_labels=Mock(side_effect=[['-1'],['11']])
+        fields=observer.numeric_fields(frame)
+        self.assertEqual([field['value'] for field in fields],['-1','11'])
+        self.assertTrue(all(field.get('kind')!='ordered_card' for field in fields))
+        self.assertEqual(observer.read_numeric_labels.call_count,2)
+
+    def test_selected_ordering_card_is_read_and_never_typed_into(self):
+        from observer import Observer
+        observer = Observer.__new__(Observer)
+        frame = np.full((800,1200,3),255,np.uint8)
+        answers = ['-7.8','-7.2','-4.4','-4','4.3','7.6']
+        for i,answer in enumerate(answers):
+            x = 90 + i*170
+            cv2.rectangle(frame,(x,460),(x+140,520),(210,210,210),2)
+            if i==5:
+                cv2.rectangle(frame,(x+2,462),(x+138,518),(255,235,220),-1)
+        observer.read_numeric_labels = Mock(side_effect=[[value] for value in answers])
+        fields = observer.numeric_fields(frame)
+        self.assertEqual([field['value'] for field in fields],answers)
+        self.assertTrue(all(field.get('kind')=='ordered_card' for field in fields))
+        session = BookworkSession(Mock(),Mock());session.code='2C'
+        session.accept_solution({'question_code':'2C','parts':[{'part':str(i),'answer':value,'workings_latex':None} for i,value in enumerate(answers)]})
+        session.observer.numeric_fields.return_value=fields
+        self.assertEqual(session.verified_fields(frame),fields)
+        self.assertIsNone(session.next_entry(frame))
+
     def test_animation_cannot_keep_waits_running_forever(self):
         guard = RecoveryGuard()
         self.assertEqual([guard.observe({'type': 'wait'}, []) for _ in range(4)], [False, False, False, True])
@@ -62,7 +98,9 @@ class RecoveryTests(unittest.TestCase):
             report=build_report(store.snapshot())
             self.assertEqual(report.ready,['5C'])
             path=exporter.default_path(store.snapshot(),store.path)
-            self.assertIn('7-2(4.6)=-2.2',path.read_text())
+            self.assertIn('7-2(4.6)=-2.2',report.markdown)
+            self.assertEqual(path.read_text().count('![](<'),4)
+            self.assertTrue(path.with_suffix('.html').is_file())
             self.assertIsNone(store.verified_answer('5C'))  # Multipart is not a guessed scalar bookwork answer.
             self.assertTrue(all(not event['error'] for event in events))
 

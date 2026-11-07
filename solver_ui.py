@@ -14,6 +14,7 @@ from planner import load_api_config
 from retry_policy import QuestionRetries
 from homework_store import HomeworkStore
 from workings_export import WorkingsExporter, build_report
+from app_version import VERSION
 
 
 class SolverUI:
@@ -82,7 +83,7 @@ class SolverUI:
         self._nav_marker.place(x=0, y=149)
         footer = ctk.CTkFrame(sidebar, fg_color="transparent")
         footer.pack(side="bottom", fill="x", padx=23, pady=24)
-        self._label(footer, "DESKTOP / v4.3", 10, muted=True).pack(anchor="w")
+        self._label(footer, f"DESKTOP / v{VERSION}", 10, muted=True).pack(anchor="w")
         self.topmost_badge = self._label(footer, "Ready to focus", 10, muted=True)
         self.topmost_badge.pack(anchor="w", pady=(5, 0))
         self._content = ctk.CTkFrame(self, fg_color="transparent", corner_radius=0)
@@ -172,6 +173,9 @@ class SolverUI:
         self.workings_checkbox = ctk.CTkCheckBox(option_row, text="Save workings",
             variable=self.workings_var, command=self._apply_preferences, checkbox_width=20, checkbox_height=20)
         self.workings_checkbox.pack(side="left")
+        self.workings_autosave_label = self._label(options, 'Workings save automatically to Documents when enabled.', 11, muted=True)
+        self.workings_autosave_label.configure(wraplength=490)
+        self.workings_autosave_label.pack(anchor='w', padx=18, pady=(0,12))
         hero = self._card(page)
         self._orb = tk.Canvas(hero, width=90, height=90, highlightthickness=0, bd=0)
         self._orb.pack(side="left", padx=(16,10), pady=12)
@@ -190,12 +194,17 @@ class SolverUI:
         controls.pack(fill="x", pady=(0, 14))
         controls.grid_columnconfigure(0, weight=3)
         controls.grid_columnconfigure(1, weight=1)
+        controls.grid_columnconfigure(2, weight=1)
         self.start_btn = ctk.CTkButton(controls, text="Start solver  →", height=48, corner_radius=12,
                                       font=("Segoe UI", 14, "bold"), command=self._on_start)
         self.start_btn.grid(row=0, column=0, sticky="ew", padx=(0, 9))
         self.stop_btn = ctk.CTkButton(controls, text="Stop · Esc", height=48, corner_radius=12,
                                      fg_color=self.RAISED, hover_color="#8b3346", text_color=self.TEXT, command=self._on_stop)
-        self.stop_btn.grid(row=0, column=1, sticky="ew")
+        self.stop_btn.grid(row=0, column=2, sticky="ew")
+        self.pause_btn = ctk.CTkButton(controls, text='Pause', height=48, corner_radius=12,
+                                      fg_color=self.RAISED, text_color=self.TEXT,
+                                      command=self._on_pause_resume, state='disabled')
+        self.pause_btn.grid(row=0, column=1, sticky='ew', padx=(0,9))
         self.stop_btn.configure(state="disabled")
         self._accent_widgets.extend([self.start_btn])
         self.status_label = self._label(page, "Choose your homework browser above, then press Start.", 12, muted=True)
@@ -387,6 +396,8 @@ class SolverUI:
         display = self._card(scroll, "Visibility")
         self.log_switch = ctk.CTkSwitch(display, text="Show live activity log on Solver", variable=self.log_visible_var, command=self._toggle_log)
         self.log_switch.pack(anchor="w", padx=18, pady=16)
+        ctk.CTkButton(display, text="Open session logs", command=self._open_session_logs,
+                      fg_color=self.RAISED, text_color=self.TEXT).pack(fill="x", padx=18, pady=(0,14))
 
         review = self._card(scroll, "Questions needing help")
         self._label(review, "1 wrong → high reasoning · 4 wrong → save & skip", 11, muted=True).pack(anchor="w", padx=18, pady=10)
@@ -396,7 +407,7 @@ class SolverUI:
         options = self._card(scroll, "Automation")
         self.option_switches = []
         for text, name in (("Finish sound", "sound"), ("Input delays", "delay"), ("Smooth pointer", "pointer"),
-                           ("Numeric keyboard entry", "keyboard"), ("Fast submit", "submit")):
+                           ("Numeric keyboard entry", "keyboard"), ("Fast submit · trust the last numeric entry", "submit")):
             switch = ctk.CTkSwitch(options, text=text, variable=getattr(self, name + "_var"), command=self._apply_preferences)
             switch.pack(anchor="w", padx=18, pady=8)
             self.option_switches.append(switch)
@@ -432,6 +443,15 @@ class SolverUI:
             import subprocess
             import sys
             subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(folder)])
+
+    def _open_session_logs(self):
+        """Open local diagnostics for stopped runs and unexpected failures."""
+        folder = self._runtime_log_path.parent
+        if os.name == 'nt':
+            os.startfile(str(folder))
+        else:
+            import subprocess, sys
+            subprocess.Popen(['open' if sys.platform=='darwin' else 'xdg-open', str(folder)])
 
     def _build_appearance(self):
         page = self._pages["Appearance"]
@@ -480,20 +500,25 @@ class SolverUI:
         self._workings_enabled = enabled
         if store and enabled:
             path = store.path
-            store.on_change = lambda snapshot, path=path: self._workings_exporter.schedule(snapshot, path)
+            store.on_change = lambda snapshot, path=path: self._workings_exporter.schedule(snapshot, path, automatic=True)
             store.on_change(store.snapshot())
+        message = ('Automatic save: ' + str(self._workings_exporter.automatic_path(store.snapshot()).parent)
+                   if store and enabled else 'Create or open a set to save workings automatically in Documents.'
+                   if enabled else 'Automatic workings saving is off. Existing files are kept.')
+        if hasattr(self, 'workings_autosave_label'):
+            self.workings_autosave_label.configure(text=message)
         if hasattr(self, "workings_status"):
-            self.workings_status.configure(text="Local checkpoints update automatically; saved files contain mathematical notation only." if enabled else "Workings are off for the next question set. Previously saved files remain available.")
+            self.workings_status.configure(text=message)
 
     def _build_workings(self):
         page = self._pages["Workings"]
         self._heading(page, "Workings", "Minimal mathematical steps for your verified answers.")
         self.workings_coverage = self._label(page, "", 12)
         self.workings_coverage.pack(fill="x", pady=(0, 6))
-        self._label(page, "LaTeX source · save Markdown for a compatible mathematical viewer", 11, muted=True).pack(anchor="w", pady=(0, 10))
-        self.workings_source = ctk.CTkTextbox(page, fg_color=self.PANEL, text_color=self.TEXT, font=("Consolas", 12), corner_radius=12)
+        self._label(page, "Rendered mathematics · Markdown images and an offline browser copy", 11, muted=True).pack(anchor="w", pady=(0, 10))
+        self.workings_source = ctk.CTkScrollableFrame(page, fg_color=self.PANEL, corner_radius=12)
         self.workings_source.pack(fill="both", expand=True)
-        self.workings_source.configure(state="disabled")
+        self._workings_images = []
         self.workings_review = ctk.CTkTextbox(page, height=90, fg_color=self.PANEL, text_color=self.MUTED, font=("Segoe UI", 11), corner_radius=12)
         self.workings_review.pack(fill="x", pady=(10, 10))
         self.workings_review.configure(state="disabled")
@@ -506,6 +531,9 @@ class SolverUI:
         self.workings_copy_btn.pack(side="left", padx=8)
         self.workings_folder_btn = ctk.CTkButton(buttons, text="Open folder", command=self._open_workings_folder, fg_color=self.RAISED, text_color=self.TEXT, width=110, height=36)
         self.workings_folder_btn.pack(side="left")
+        self.workings_preview_btn = ctk.CTkButton(buttons, text="Open preview", command=self._open_workings_preview,
+                                                fg_color=self.RAISED, text_color=self.TEXT, width=105, height=36)
+        self.workings_preview_btn.pack(side="left", padx=(8, 0))
         self.workings_status = self._label(page, "Local checkpoints update automatically; files contain mathematical notation only.", 11, muted=True)
         self.workings_status.configure(wraplength=520)
         self.workings_status.pack(fill="x", pady=(10, 0))
@@ -520,12 +548,13 @@ class SolverUI:
         snapshot = store.snapshot() if store else {'attempts': []}
         report = build_report(snapshot)
         self._workings_report = report
+        preview_token = (id(store), store.revision if store else None)
+        if report.ready and preview_token != getattr(self, '_workings_preview_token', None):
+            self._workings_preview_token = preview_token
+            self._workings_exporter.preview(snapshot, preview_token)
         name = snapshot.get('name', 'Select a homework record on Solver')
         self.workings_coverage.configure(text=f"{name}\n{len(report.ready)}/{report.total} captured questions ready · {len(report.review)} need review")
-        self.workings_source.configure(state="normal")
-        self.workings_source.delete("1.0", "end")
-        self.workings_source.insert("end", report.markdown)
-        self.workings_source.configure(state="disabled")
+        self._render_workings_preview(report)
         notes = "\n".join(f"{code}: {reason}" for code, reason in report.review) or "No captured questions need review." if store else "Create or open a homework record on Solver. Older answers without saved workings cannot be reconstructed automatically."
         self.workings_review.configure(state="normal")
         self.workings_review.delete("1.0", "end")
@@ -534,6 +563,48 @@ class SolverUI:
         self.workings_save_btn.configure(state="normal" if report.ready and not self._workings_saving else "disabled")
         self.workings_copy_btn.configure(state="normal" if report.ready else "disabled")
         self.workings_folder_btn.configure(state="normal" if store else "disabled")
+        self.workings_preview_btn.configure(state="normal" if report.ready else "disabled")
+
+    def _render_workings_preview(self, report):
+        """Show equations as offline images instead of displaying TeX escape commands."""
+        import re
+        from io import BytesIO
+        from PIL import Image
+        for child in self.workings_source.winfo_children():
+            child.destroy()
+        self._workings_images = []
+        assets = {name: source for source, name in report.assets}
+        for block in re.finditer(r'^## ([^\n]+)$|\$\$\n(.*?)\n\$\$|!\[\]\(assets/([^\n]+)\)', report.markdown, re.M | re.S):
+            if block[1]:
+                self._label(self.workings_source, block[1], 18, bold=True).pack(anchor="w", padx=12, pady=(14, 5))
+                continue
+            try:
+                if block[2]:
+                    data = getattr(self, '_workings_preview_data', {}).get(block[2])
+                    if data is None:
+                        self._label(self.workings_source, "Rendering equation…", 11, muted=True).pack(anchor="w", padx=12, pady=8)
+                        continue
+                    image = Image.open(BytesIO(data))
+                else:
+                    image = Image.open(assets[block[3]])
+                image.load()
+                scale = min(1., 470 / image.width)
+                size = (max(1, int(image.width * scale)), max(1, int(image.height * scale)))
+                rendered = ctk.CTkImage(light_image=image, dark_image=image, size=size)
+                self._workings_images.append(rendered)
+                ctk.CTkLabel(self.workings_source, text="", image=rendered).pack(anchor="w", padx=10, pady=6)
+            except Exception as error:
+                self._label(self.workings_source, f"Preview unavailable: {error}", 11, muted=True).pack(anchor="w")
+        if not report.ready:
+            self._label(self.workings_source, "Verified workings will appear here after a correct answer.", 12, muted=True).pack(anchor="w", padx=12, pady=20)
+
+    def _open_workings_preview(self):
+        """Export the current verified snapshot and open its standalone HTML copy."""
+        if not self.homework_store:
+            return
+        self._open_preview_when_ready = True
+        self._workings_exporter.schedule(self.homework_store.snapshot(), self.homework_store.path,
+                                        self._workings_output_path())
 
     def _save_workings_markdown(self):
         store = self.homework_store
@@ -564,10 +635,16 @@ class SolverUI:
                 self.clipboard_append(report.markdown)
                 self.workings_status.configure(text="Verified LaTeX workings copied.")
 
+    def _workings_output_path(self):
+        """Find automatic files first, retaining access to earlier local checkpoints."""
+        snapshot = self.homework_store.snapshot()
+        automatic = WorkingsExporter.automatic_path(snapshot)
+        return automatic if self.workings_var.get() or automatic.exists() else WorkingsExporter.default_path(snapshot, self.homework_store.path)
+
     def _open_workings_folder(self):
         if not self.homework_store:
             return
-        folder = WorkingsExporter.default_path(self.homework_store.snapshot(), self.homework_store.path).parent
+        folder = self._workings_output_path().parent
         try:
             folder.mkdir(parents=True, exist_ok=True)
             if os.name == "nt": os.startfile(str(folder))
@@ -581,15 +658,30 @@ class SolverUI:
         try:
             while True:
                 event = self._workings_queue.get_nowait()
+                if event['kind'] == 'preview':
+                    if event['token'] == getattr(self, '_workings_preview_token', None):
+                        self._workings_preview_data = event['images']
+                        self._render_workings_preview(self._workings_report)
+                        if event['error']:
+                            self.workings_status.configure(text="Preview could not render: " + event['error'])
+                    continue
                 if event['kind'] == 'save':
                     self._workings_saving = False
                 if self.homework_store and event['id'] == self.homework_store.data['id']:
                     if event['error']:
                         self.workings_status.configure(text="Workings file was not saved: " + event['error'])
+                        if event['kind'] == 'automatic':
+                            self.workings_autosave_label.configure(text='Automatic save failed: ' + event['error'])
                     elif event.get("empty"):
                         self.workings_status.configure(text="No verified workings are ready yet. See the review list above.")
                     else:
-                        self.workings_status.configure(text=("Saved: " if event['kind'] == 'save' else "Local checkpoint: ") + event['path'])
+                        self.workings_status.configure(text=("Saved automatically: " if event['kind'] == 'automatic' else "Saved: " if event['kind'] == 'save' else "Local checkpoint: ") + event['path'])
+                        if event['kind'] == 'automatic':
+                            self.workings_autosave_label.configure(text='Saved automatically: ' + event['path'])
+                        if getattr(self, '_open_preview_when_ready', False) and event.get('preview_path'):
+                            import webbrowser
+                            self._open_preview_when_ready = False
+                            webbrowser.open(Path(event['preview_path']).resolve().as_uri())
         except queue.Empty:
             pass
 
@@ -787,6 +879,11 @@ class SolverUI:
 
     def _workspace_tick(self):
         now = time.monotonic()
+        if self.controller and self._is_running:
+            paused = self.controller.is_paused
+            self.pause_btn.configure(text='Resume' if paused else 'Pause')
+            if paused:
+                self.status_label.configure(text='Paused: ' + self.controller.pause_reason + '. Correct the page, then Resume. Progress is saved.', text_color='orange')
         if now - getattr(self, "_last_front_check", 0) > 1:
             self._last_front_check = now
             self._keep_in_front()

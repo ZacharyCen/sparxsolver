@@ -46,11 +46,15 @@ Click **New set** and name the assignment. Use **Open saved set** only to resume
 
 - Enable **Bookwork check** when the assignment requires an end check. Disable it for exercises without one.
 - Enable **Save workings** if you want a mathematical workings file.
+
+With **Save workings** checked, files save automatically after each verified correct answer to **Documents → Sparx Solver → Workings → your assignment folder**. The Solver page shows the location; use **Workings → Open folder** to find the Markdown, equation images, and readable HTML copy. No Save dialog or final export is required. Unchecking it stops automatic updates and keeps existing files.
 - Set **Human pacing** to **Off** for faster operation.
 
 Click **Start solver**. The app detects the visible question set automatically and skips tabs already marked correct; you do not enter a question count. Existing correct answers have no saved workings or bookwork answers unless they were previously recorded by the app.
 
 The panel stays on top and greys out while working. Press **Esc** or **Stop** to cancel. If hidden, press **F8** to restore it. Read the final status: a stopped run or a question needing review does not mean the homework is complete.
+
+Use **Pause** to correct an answer or inspect a stuck dropdown, then **Resume** to continue the same run. Pending grading, verified answers, and workings are retained. Repeating control sequences trigger bounded replanning, then a logged skip to a verified unfinished question; if navigation is unsafe, the solver pauses for manual repair. A decision received during a pause is discarded. After an application restart, open the same saved set; correct browser tabs are skipped and saved answers remain available. Uncertain submissions still need review.
 
 After the first confirmed wrong submission, reasoning increases from low to high. After four failures, the app records **Needs Human intervention** and attempts to move to the next question. Review these questions yourself.
 
@@ -58,7 +62,7 @@ After the first confirmed wrong submission, reasoning increases from low to high
 
 When enabled, the solver attempts the final bookwork check using verified answers saved in the current homework record. Supported matching covers numeric answers and numeric answer-image cards. Missing, ambiguous, unreadable, or unsupported answers require human review. Successful completion includes verifying **Passed** and clicking Continue.
 
-Open **Workings → Save Markdown** to export verified workings, **Copy workings** to copy mathematical notation, or **Open folder** to find automatic checkpoints. Keep any accompanying image-assets folder beside the `.md` file when moving or sharing it. Use a Markdown viewer with LaTeX support for mathematical rendering; the app itself exports LaTeX source rather than a rendered PDF.
+The **Workings** page displays formatted equations. Choose **Save Markdown** to export verified workings, **Copy workings** to copy LaTeX source, or **Open folder** to find automatic checkpoints. Markdown exports display equations as images: keep the accompanying image-assets folder beside the `.md` file when moving or sharing it. A standalone `.html` copy is also saved with embedded images; open it in a browser to read or print the workings without a LaTeX plugin or internet connection. **Open preview** opens this browser copy directly.
 
 Only captured questions with supported, verified workings appear in the export. Check the coverage and review list before copying calculations into your book.
 
@@ -70,12 +74,16 @@ Only captured questions with supported, verified workings appear in the export. 
 | Adjust pacing | **Waiting Time** ranges from 0–5 seconds and applies when input delays are enabled. It does not remove API or page-loading time. |
 | Completion notification | Enable **Finish sound** in Configuration; also check the final status. |
 | See what is happening | Enable **Show live activity log on Solver** in Configuration. |
+| Investigate a stopped run | Read the status below Start, then choose **Configuration → Open session logs**. Stopping automation keeps the panel open; logs also capture unexpected failures. |
 | Track API use | Open **Usage** for session input/output token counts reported by the API. These are not a billing statement. |
 | Change the appearance | Open **Appearance** to adjust the available visual settings and animations. |
 | Connection timeout | Check internet access, the server URL, credentials, and model availability. For a local server, confirm it is running and reachable. |
-| Repeated clicks or no progress | Stop, inspect the page and selected window/region, and read the activity log before restarting. |
+| Repeated clicks or no progress | Use **Pause**, correct the controls in the browser, then **Resume**. Automatic loop recovery also saves review logs. |
+| Question tabs temporarily unreadable | Startup retries for up to eight seconds, then pauses with progress retained. Expose the full question-tab row and Summary, then **Resume**. |
 | Uncertain saved submission | Inspect the browser, then use **Review pending**. This discards uncertain outcomes; it does not mark answers correct. |
 | Missing workings | Confirm **Save workings** was enabled before starting and inspect the Workings coverage/review list. |
 | Question needs help | Use **Configuration → Open human review logs**, then review the question in the browser. |
 
 Homework records, checkpoints, and review logs stay local. Treat exported files and screenshots as private when sharing them.
+
+With **Fast submit** enabled, a completed plain numeric entry is submitted immediately when Submit is enabled, without another full-field scan or model decision. This trusts the final-entry signal and can submit a mistaken entry; Sparx's grading still controls retries, progress, and which answers are saved as correct. Turn it off for full readback before submission. Fractions, expression selectors, and unfamiliar controls retain their normal readback checks. Identical screenshots reuse one readback, and short grading transitions are handled locally.

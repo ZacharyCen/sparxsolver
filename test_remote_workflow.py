@@ -201,7 +201,8 @@ class RemoteWorkflowTests(unittest.TestCase):
         planner.plan.assert_called_once()
         observer.verify_numeric_entry.assert_called_once()
         self.assertEqual(c.current_question_count, 1)
-        self.assertEqual([call.args[0]["type"] for call in executor.execute.call_args_list], ["type_text", "press_enter", "click"])
+        # Unknown controls use the grounded Submit button; Enter can open a dropdown.
+        self.assertEqual([call.args[0]["type"] for call in executor.execute.call_args_list], ["type_text", "click", "click"])
 
     def test_intermediate_digit_never_triggers_fast_submit(self):
         observer, planner, executor = Mock(), Mock(), Mock()

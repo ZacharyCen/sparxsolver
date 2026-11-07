@@ -129,7 +129,7 @@ class HomeworkStore:
         finally:
             temporary.unlink(missing_ok=True)
 
-    def prepare(self, code, answer, solution=None):
+    def prepare(self, code, answer, solution=None, ordered=False):
         """Persist intent before physical input; unresolved attempts are never answers."""
         if not re.fullmatch(r'\d{1,3}[A-Z]', code):
             raise ValueError('Invalid question code')
@@ -148,6 +148,11 @@ class HomeworkStore:
                     raise ValueError('Solution snapshot does not match the submitted numeric value')
                 attempt['parts'] = copy.deepcopy(parts)
                 attempt['solution_revision'] = self.data['proposals'].get(code, {}).get('revision', 0)
+                if ordered:
+                    values = [numeric_value(part['answer']) for part in parts]
+                    if len(values) < 3 or not (values == sorted(values) or values == sorted(values, reverse=True)):
+                        raise ValueError('Ordering answers must form a complete monotonic sequence')
+                    attempt['kind'] = 'ordering'
             self.data['attempts'].append(attempt)
             try:
                 self._save()
@@ -155,6 +160,26 @@ class HomeworkStore:
                 self.data['attempts'].pop()
                 raise
             return attempt['id']
+
+    def prepare_expression(self, code, solution):
+        """Persist a complete expression readback; grading is still required separately."""
+        from answer_values import expression_value
+        parts=solution.get('parts')
+        if (not re.fullmatch(r'\d{1,3}[A-Z]',code) or solution.get('question_code')!=code
+                or not self._valid_parts(parts) or any(expression_value(part['answer']) is None for part in parts)):
+            raise ValueError('Unsupported or incomplete expression submission')
+        with self._lock:
+            if any(a['code']==code and a['status'] in ('prepared','pending') for a in self.data['attempts']):
+                raise ValueError('An earlier submission still needs grading')
+            identifier=str(uuid.uuid4())
+            attempt={'id':identifier,'code':code,'answer':parts[0]['answer'],'parts':copy.deepcopy(parts),
+                     'kind':'expression','status':'prepared','time':datetime.now(timezone.utc).isoformat(),
+                     'solution_revision':self.data['proposals'].get(code,{}).get('revision',0)}
+            self.data['attempts'].append(attempt)
+            try:self._save()
+            except Exception:
+                self.data['attempts'].pop();raise
+            return identifier
 
     def prepare_visual(self, code, image, parts=None):
         """Save an observed diagram before submission; export still requires correct grading."""
@@ -213,6 +238,19 @@ class HomeworkStore:
                     if not values:
                         values = (attempt['answer'],)
                     return values if all(numeric_value(value) is not None for value in values) else None
+        return None
+
+    def verified_check_values(self, code):
+        """Read exact rational/surd answers only from the latest graded submission."""
+        from answer_values import expression_value
+        with self._lock:
+            for attempt in reversed(self.data['attempts']):
+                if attempt['code'] != code:
+                    continue
+                if attempt['status'] != 'correct' or attempt.get('kind') == 'diagram':
+                    return None
+                values = tuple(part['answer'] for part in attempt.get('parts', [])) or (attempt['answer'],)
+                return values if all(expression_value(value) is not None for value in values) else None
         return None
 
     def begin_check(self, code):

@@ -17,6 +17,14 @@ from pynput.keyboard import Key, Controller as KeyboardController
 import pyperclip
 
 
+class UnsupportedInputMethod(ValueError):
+    """The selected input shortcut cannot enter this answer; use other controls."""
+
+
+class ExecutionPaused(RuntimeError):
+    """An action was blocked before dispatch because the user paused input."""
+
+
 class ActionExecutor:
     """
     Executes single-step atomic actions planned by the model.
@@ -36,6 +44,14 @@ class ActionExecutor:
         self.smooth_pointer = False
         self.keyboard_entry_enabled = True
         self._cancelled = False
+        self._paused = False
+
+    def pause(self):
+        """Block new actions while allowing the current atomic input to release normally."""
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
 
     def set_roi_offset(self, offset_x: int, offset_y: int) -> None:
         """Updates the ROI offset for translating image coordinates to screen coordinates."""
@@ -50,6 +66,7 @@ class ActionExecutor:
     def reset_cancellation(self) -> None:
         """Resets cancellation flag for the next cycle."""
         self._cancelled = False
+        self._paused = False
 
     def is_cancelled(self) -> bool:
         """Checks if current execution has been cancelled."""
@@ -91,6 +108,8 @@ class ActionExecutor:
         """
         Executes a validated single-step action dict.
         """
+        if getattr(self, '_paused', False):
+            raise ExecutionPaused('Input is paused')
         if self._cancelled:
             print("[Executor] Action skipped: cancelled.")
             return
@@ -135,15 +154,28 @@ class ActionExecutor:
         else:
             self.mouse.position = (x, y)
 
+    @staticmethod
+    def numeric_keyboard_text(text: str) -> Optional[str]:
+        """Normalize plain decimal input; expressions require other entry controls."""
+        import re
+        value=str(text).strip().replace('−','-').replace('–','-')
+        if not re.fullmatch(r'[+-]?(?:\d+(?:\.\d*)?|\.\d+)',value):
+            return None
+        value=value.lstrip('+')
+        if value.startswith('.'):value='0'+value
+        if value.startswith('-.'):value='-0'+value[1:]
+        return value if len(value)<=32 else None
+
     def type_text(self, target: List[int], text: str) -> None:
         """Replace a focused numeric answer using real keyboard events."""
-        import re
         if self._cancelled:
             return
         if not self.keyboard_entry_enabled:
-            raise ValueError("Keyboard entry is disabled")
-        if not re.fullmatch(r"-?\d+(?:\.\d+)?", text) or len(text) > 32:
-            raise ValueError("Keyboard shortcut supports numeric answers up to 32 characters")
+            raise UnsupportedInputMethod("Numeric keyboard entry is disabled; use the visible answer controls")
+        normalized=self.numeric_keyboard_text(text)
+        if normalized is None:
+            raise UnsupportedInputMethod("This answer requires fraction/expression controls or a text field; the numeric shortcut cannot enter it")
+        text=normalized
         if getattr(self, "browser_session", None):
             self.browser_session.type_text(target, text, self.is_cancelled)
             return

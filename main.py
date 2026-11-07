@@ -9,6 +9,7 @@ Implements:
 """
 
 import datetime
+import queue
 import sys
 import threading
 import tkinter as tk
@@ -25,6 +26,7 @@ from observer import init_dpi_awareness, Observer
 from planner import CodexCliPlanner, RemoteApiPlanner, BasePlanner
 from executor import ActionExecutor
 from controller import AutoAnswerController
+from app_version import VERSION
 from win_utils import get_candidate_windows, get_window_bounds, activate_target_window
 
 
@@ -419,8 +421,12 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
 
     def __init__(self):
         super().__init__()
+        self._ui_log_queue = queue.SimpleQueue()
+        self._closing = False
+        from runtime_log import start_session_log
+        self._runtime_log, self._runtime_log_path = start_session_log()
 
-        self.title("AutoAnswer Assistant")
+        self.title("AutoAnswer Assistant · v" + VERSION)
         self.geometry("920x740")
         self.minsize(840, 660)
         self.attributes("-topmost", True)
@@ -458,9 +464,17 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
 
         # Redirect standard streams to in-app Console Log
         self._setup_logging()
+        from runtime_log import InterfaceWatchdog
+        self._interface_watchdog = InterfaceWatchdog(self._runtime_log, self._runtime_log_path)
+        self._interface_watchdog.start()
 
     def destroy(self):
         """Finish queued local exports and release input when the panel closes."""
+        self._closing = True
+        if hasattr(self, '_interface_watchdog'):
+            self._interface_watchdog.close()
+        if getattr(self, '_runtime_log', None):
+            self._runtime_log.info('Window close requested; running=%s', getattr(self,'_is_running',False))
         if getattr(self, "_is_running", False):
             if getattr(self, "controller", None):
                 try: self.controller.stop("Application closed")
@@ -485,12 +499,45 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
         sys.stdout = StdoutRedirector(self.log, self._orig_stdout)
         sys.stderr = StdoutRedirector(self.log, self._orig_stderr)
         self.log("AutoAnswer Assistant initialized. Front layer active.")
+        self.log(f"Running build {VERSION} from {sys.executable}")
+        self.log(f"Session diagnostics: {self._runtime_log_path}")
+        self.after(50, self._drain_ui_logs)
 
     def log(self, message: str):
         """Thread-safe logging to the UI console textbox."""
         now_str = datetime.datetime.now().strftime("%H:%M:%S")
         formatted = f"[{now_str}] {message}"
-        self.after(0, self._append_log_text, formatted)
+        if getattr(self, '_runtime_log', None):
+            self._runtime_log.info(message)
+        self._ui_log_queue.put(('log', formatted))
+
+    def _drain_ui_logs(self):
+        """Workers enqueue events; only the Tk thread updates widgets or finishes runs."""
+        if self._closing:
+            return
+        self._interface_watchdog.beat()
+        for _ in range(200):
+            try:
+                kind, value = self._ui_log_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if kind == 'finish':
+                    self._on_finish()
+                elif kind == 'call':
+                    value()
+                else:
+                    self._append_log_text(value)
+            except Exception:
+                self.report_callback_exception(*sys.exc_info())
+        self.after(50, self._drain_ui_logs)
+
+    def report_callback_exception(self, kind, value, trace):
+        """Keep the panel open and make callback failures visible and diagnosable."""
+        self._runtime_log.error('Interface callback failed', exc_info=(kind,value,trace))
+        self.log(f'Interface error: {value}. Details: {self._runtime_log_path}')
+        if hasattr(self,'status_label'):
+            self.status_label.configure(text=f'Interface error: {value}. See session log.', text_color='orange')
 
     def _append_log_text(self, line: str):
         if hasattr(self, "log_box"):
@@ -652,9 +699,10 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
             try:
                 if key == pynput.keyboard.Key.esc and self._is_running:
                     self.log("[Global Hotkey] Esc pressed -> Emergency Stop!")
-                    self.after(0, self._on_stop)
+                    self.executor.cancel()
+                    self._ui_log_queue.put(('call', self._on_stop))
                 elif key == pynput.keyboard.Key.f8:
-                    self.after(0, self.toggle_visibility)
+                    self._ui_log_queue.put(('call', self.toggle_visibility))
             except Exception:
                 pass
 
@@ -734,9 +782,9 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
                 from browser_session import BrowserSession
                 session = BrowserSession.open()
                 session.open_homework()
-                self.after(0, lambda: opened(session=session))
+                self._ui_log_queue.put(('call', lambda session=session: opened(session=session)))
             except Exception as error:
-                self.after(0, lambda message=str(error): opened(error=message))
+                self._ui_log_queue.put(('call', lambda message=str(error): opened(error=message)))
         threading.Thread(target=launch, daemon=True).start()
 
     def _ensure_homework_record(self):
@@ -827,6 +875,7 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
         self._set_working_visuals(True)
         self.status_label.configure(text="Running • desktop input free" if self.browser_var.get() else "Running • Esc stops", text_color="#4ade80")
         self.start_btn.configure(state="disabled")
+        self.pause_btn.configure(state='normal', text='Pause')
         self.stop_btn.configure(state="normal")
         self.log("Run started in separate browser; desktop mouse and keyboard remain free." if self.browser_var.get() else "Run started. Solver remains pinned and dimmed; Esc stops it.")
 
@@ -838,9 +887,11 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
         try:
             self.controller.start()
         except Exception as e:
+            self.controller.stop(f'Controller error: {e}')
+            self._runtime_log.exception('Controller worker failed')
             self.log(f"Controller thread error: {e}")
         finally:
-            self.after(0, self._on_finish)
+            self._ui_log_queue.put(('finish', None))
 
     def _on_finish(self):
         self._is_running = False
@@ -849,6 +900,7 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
         self._set_working_visuals(False)
         self.start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        self.pause_btn.configure(state='disabled', text='Pause')
         reason = self.controller.finish_reason if self.controller else "Stopped"
         self.status_label.configure(text=reason, text_color="gray", wraplength=520)
         if self.controller and getattr(self, "_notified_controller", None) is not self.controller:
@@ -857,6 +909,17 @@ class AutoAnswerApp(SolverUI, ctk.CTk):
                 self._play_finish_sound(not reason.startswith('Needs Human intervention') and (getattr(self.controller, '_bookwork_finish_passed', False) or reason.startswith('Finished all') or (not getattr(self.controller, 'auto_complete', False) and self.controller.current_question_count >= self.controller.max_questions) or reason.startswith('Page state: completed')))
         self.log(f"Run ended: {reason}")
         self.log("Autonomous answering loop finished. Full opacity restored.")
+
+    def _on_pause_resume(self):
+        """Keep the current run and its durable homework record during manual repair."""
+        if not self.controller or not self._is_running:
+            return
+        if self.controller.is_paused:
+            self.controller.resume()
+            self.status_label.configure(text='Resuming • reading current controls afresh', text_color='#4ade80')
+        else:
+            self.controller.pause()
+            self.status_label.configure(text='Paused • correct the page, then Resume. Progress is saved.', text_color='orange')
 
     def _on_stop(self):
         if self.controller:
@@ -874,10 +937,16 @@ def main():
     if sys.platform == "win32":
         import ctypes
         kernel32 = ctypes.windll.kernel32
+        build_mutex=kernel32.CreateMutexW(None,False,'AutoAnswerAssistant_Build_'+VERSION)
+        same_build=kernel32.GetLastError()==183
         mutex = kernel32.CreateMutexW(None, False, "AutoAnswerAssistant_SingleInstance_Mutex")
         if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
             user32 = ctypes.windll.user32
-            existing_hwnd = user32.FindWindowW(None, "AutoAnswer Assistant")
+            existing_hwnd = user32.FindWindowW(None, "AutoAnswer Assistant · v" + VERSION) or user32.FindWindowW(None, "AutoAnswer Assistant")
+            if not same_build:
+                user32.MessageBoxW(None,
+                    f'An older Sparx Solver is still running. Close its window yourself, then reopen this application to load version {VERSION}. Installing an update does not change an already running process.',
+                    'Solver update is not loaded',0x40)
             if existing_hwnd:
                 user32.SetForegroundWindow(existing_hwnd)
             sys.exit(0)

@@ -28,6 +28,23 @@ def fixture(selected=None):
 
 
 class StoreTests(unittest.TestCase):
+    def test_surd_bookwork_uses_only_the_latest_verified_submission(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = HomeworkStore.create('Surds', folder)
+            solution = {'question_code': '1B', 'parts': [
+                {'part': 'a', 'answer': '5+sqrt(10)'},
+                {'part': 'b', 'answer': '5-sqrt(10)'}]}
+            key = store.prepare_expression('1B', solution)
+            self.assertIsNone(store.verified_check_values('1B'))
+            store.set_status(key, 'pending')
+            store.set_status(key, 'correct')
+            self.assertEqual(HomeworkStore(store.path).verified_check_values('1B'),
+                             ('5+sqrt(10)', '5-sqrt(10)'))
+            next_key = store.prepare_expression('1B', solution)
+            store.set_status(next_key, 'pending')
+            store.set_status(next_key, 'incorrect')
+            self.assertIsNone(store.verified_check_values('1B'))
+
     def test_exact_numbers(self):
         for text in ('1/2', '0.5', '+0.50', '.5'):
             self.assertEqual(numeric_value(text), Fraction(1, 2))
@@ -87,6 +104,84 @@ class StoreTests(unittest.TestCase):
 
 
 class BookworkTests(unittest.TestCase):
+    def test_radical_digits_are_ordered_and_overlapping_word_tokens_are_not_duplicated(self):
+        observer=Mock();observer.read_stacked_fraction.return_value=None
+        observer.read_numeric_labels.return_value=['2','6']
+        crop=np.full((112,194,3),255,np.uint8)
+        cv2.polylines(crop,[np.array([[46,58],[60,86],[80,25],[153,25]])],False,(0,0,0),1)
+        cv2.rectangle(crop,(95,37),(119,78),(0,0,0),-1)
+        cv2.rectangle(crop,(125,37),(150,78),(0,0,0),-1)
+        def item(text,left,right,top=10):
+            return ([[left,top],[right,top],[right,50],[left,50]],text,.99)
+        for raw in ([item('6',55,85),item('2',10,40)],
+                    [item('2',0,81,2),item('6',74,137,7)],
+                    [item('26',10,85),item('6',55,86,7)],
+                    [item('26',4,88,4),item('6',55,109,9)]):
+            observer._ocr.return_value=(raw,None)
+            self.assertEqual(BookworkDetector(observer).read_answer_labels(crop),['sqrt(26)'])
+
+    def test_bare_radical_is_not_read_as_its_radicand(self):
+        observer=Mock()
+        observer.read_stacked_fraction.return_value=None
+        observer.read_numeric_labels.return_value=['5']
+        for negative in (False,True):
+            with self.subTest(negative=negative):
+                crop=np.full((112,163,3),255,np.uint8)
+                cv2.polylines(crop,[np.array([[46,58],[60,86],[80,25],[122,25]])],False,(0,0,0),1)
+                cv2.rectangle(crop,(95,38),(118,78),(0,0,0),-1)
+                if negative:cv2.line(crop,(10,55),(30,55),(0,0,0),2)
+                self.assertEqual(BookworkDetector(observer).read_answer_labels(crop),
+                                 ['-sqrt(5)' if negative else 'sqrt(5)'])
+
+    def test_expression_choices_keep_visual_evidence_without_inventing_bookwork_values(self):
+        from observer import Observer
+        with tempfile.TemporaryDirectory() as folder:
+            observer=Observer.__new__(Observer)
+            observer.read_question_code=Mock(return_value='2C')
+            observer.numeric_choice_cards=Mock(return_value=[
+                {'value':'','selected':True,'bounds':[10,100,100,70]},
+                {'value':'3333','selected':True,'bounds':[130,100,100,70]},
+                {'value':'64','selected':False,'bounds':[250,100,100,70]}])
+            store=HomeworkStore.create('Choices',folder)
+            session=BookworkSession(observer,Mock(),store);session.code='2C'
+            session.accept_solution({'question_code':'2C','parts':[
+                {'part':'1','answer':'3^3*3','workings_latex':'3^4=3^3*3'},
+                {'part':'2','answer':'3*3*3*3','workings_latex':'3^4=3*3*3*3'}]})
+            frame=np.full((600,800,3),255,np.uint8)
+            image=session.visual_choice_readback(frame)
+            self.assertIsNotNone(image)
+            key=session.prepare_submission(frame,visual_choices=image)
+            self.assertIsNone(store.verified_check_values('2C'))
+            session.dispatched(key);session.grade(True,frame)
+            self.assertEqual(store.data['attempts'][-1]['kind'],'diagram')
+            self.assertEqual(store.data['attempts'][-1]['status'],'correct')
+            self.assertIsNone(store.verified_check_values('2C'))
+
+    def test_radical_layout_does_not_become_concatenated_digits(self):
+        crop = np.full((52,106,3),255,np.uint8)
+        cv2.rectangle(crop,(7,17),(17,35),(0,0,0),-1)
+        cv2.line(crop,(27,28),(44,28),(0,0,0),1)
+        cv2.line(crop,(35,19),(35,36),(0,0,0),1)
+        cv2.polylines(crop,[np.array([[53,25],[59,37],[66,12],[99,12]])],False,(0,0,0),1)
+        cv2.rectangle(crop,(76,17),(84,34),(0,0,0),-1)
+        cv2.rectangle(crop,(88,17),(99,35),(0,0,0),-1)
+        observer=Mock()
+        observer.read_stacked_fraction.return_value=None
+        observer.read_numeric_labels.side_effect=lambda field: ['10'] if field.shape[0]<40 else ['5']
+        self.assertEqual(BookworkDetector(observer).read_answer_labels(crop),['5+sqrt(10)'])
+
+    def test_selection_waits_for_delayed_feedback_beyond_eight_frames(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session, executor = self.setup_session(folder)
+            frame,_ = fixture()
+            chosen,_ = fixture(selected=0)
+            view=BookworkView('1B',[('5',[265,345]),('8',[535,345])],control=[700,650])
+            accepted=BookworkView('1B',[],'accepted',[700,650])
+            session.detector.inspect=Mock(side_effect=[view,view,view,view]+[view]*10+[accepted,accepted,None])
+            self.assertTrue(session.handle(frame,Mock(side_effect=[frame]+[chosen]*30)))
+            self.assertEqual(session.completed_checks,1)
+            self.assertEqual(executor.execute.call_count,3)
+
     def test_detector_grounds_all_six_cards_and_code(self):
         frame, items = fixture()
         result = BookworkDetector.from_items(frame, items)
@@ -146,7 +241,7 @@ class BookworkTests(unittest.TestCase):
             session, executor = self.setup_session(folder)
             one = BookworkView('1B', [('5', [100, 300]), ('8', [300, 300])])
             two = BookworkView('1B', [('8', [100, 300]), ('5', [300, 300])])
-            session.detector.inspect = Mock(side_effect=[one, two])
+            session.detector.inspect = Mock(side_effect=[one, two, two, two])
             with self.assertRaises(BookworkReview): session.handle(np.zeros((800, 1000, 3), np.uint8), lambda: np.zeros((800, 1000, 3), np.uint8))
             executor.execute.assert_not_called()
 

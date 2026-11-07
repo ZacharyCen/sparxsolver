@@ -39,7 +39,7 @@ class ChoiceTests(unittest.TestCase):
         obs.footer_navigation_items.return_value=[]
         executor.is_cancelled.return_value=False
         def execute(action):
-            if action['type']=='press_enter':
+            if action.get('purpose')=='submit':
                 self.assertTrue(state['A'] and state['B']);state['graded']=True
             elif action['target']==[200,300]:state['A']=True
             elif action['target']==[400,300]:state['B']=True
@@ -50,6 +50,6 @@ class ChoiceTests(unittest.TestCase):
         planner.plan.assert_not_called()
         obs.extract_auxiliary_reference.assert_not_called()
         self.assertEqual(control.current_question_count,1)
-        self.assertEqual([call.args[0]['type'] for call in executor.execute.call_args_list],['click','click','press_enter','click'])
+        self.assertEqual([call.args[0]['type'] for call in executor.execute.call_args_list],['click','click','click','click'])
 
 if __name__=='__main__':unittest.main()
